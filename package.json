@@ -1,0 +1,11 @@
+{
+  "name": "iphone-drive-backup",
+  "version": "1.0.0",
+  "description": "iPhone 手動備份至 Google Drive 的 PWA 網頁",
+  "scripts": {
+    "start": "npx serve .",
+    "build": "echo '靜態網站，無需建置步驟' && exit 0"
+  },
+  "author": "",
+  "license": "MIT"
+}

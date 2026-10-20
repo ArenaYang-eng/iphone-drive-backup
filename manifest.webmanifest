@@ -1,0 +1,14 @@
+{
+  "name": "我的備份中心",
+  "short_name": "備份中心",
+  "description": "手動備份 iPhone 選取的照片、影片與文件至 Google Drive",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f7fa",
+  "theme_color": "#1769aa",
+  "icons": [
+    {"src": "./icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "./icon-512.png", "sizes": "512x512", "type": "image/png"}
+  ]
+}

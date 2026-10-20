@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1769aa">
+  <meta name="description" content="從 iPhone 手動選取照片、影片與文件，備份到自己的 Google Drive。">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="./icon-192.png">
+  <title>我的備份中心</title>
+  <style>
+    :root { color-scheme: light; --blue:#1769aa; --ink:#18212b; --muted:#5f6b76; --line:#dce3e9; --bg:#f4f7fa; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }
+    main { max-width:720px; margin:0 auto; padding:20px 16px calc(32px + env(safe-area-inset-bottom)); }
+    header { display:flex; gap:12px; align-items:center; margin:8px 0 20px; }
+    .logo { width:48px;height:48px;border-radius:14px;background:var(--blue);color:white;display:grid;place-items:center;font-size:24px; }
+    h1 { font-size:23px; margin:0 0 4px; } h2 { font-size:17px; margin:0 0 12px; }
+    .sub,.hint { color:var(--muted); font-size:13px; line-height:1.55; }
+    .card { background:white; border:1px solid var(--line); border-radius:16px; padding:16px; margin:12px 0; box-shadow:0 2px 8px #10203008; }
+    button,.button { display:inline-flex; justify-content:center; align-items:center; min-height:44px; padding:11px 14px; border:0; border-radius:11px; background:var(--blue); color:white; font-size:15px; font-weight:600; text-decoration:none; cursor:pointer; }
+    button.secondary { background:#e8f1f8; color:#154f7e; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .full { width:100%; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .status { display:flex; justify-content:space-between; gap:10px; align-items:center; }
+    .pill { border-radius:999px; background:#eef2f5; padding:5px 9px; font-size:12px; color:#43505b; white-space:nowrap; }
+    .pill.ok { background:#e4f6eb; color:#17633a; } .pill.warn { background:#fff3d7;color:#805400; }
+    .picker { display:block; padding:14px; border:1px dashed #9cb2c5; border-radius:12px; margin:10px 0; }
+    .picker strong { display:block; margin-bottom:5px; } input[type=file] { display:block; width:100%; margin-top:10px; font-size:14px; }
+    ul { list-style:none; margin:0; padding:0; } li.file { padding:10px 0; border-bottom:1px solid #edf0f3; overflow-wrap:anywhere; } li.file:last-child { border-bottom:0; }
+    .filemeta { color:var(--muted); font-size:12px; margin-top:4px; }
+    progress { width:100%; height:12px; margin:10px 0; accent-color:var(--blue); }
+    .notice { background:#fff8e7; border:1px solid #f0d99a; padding:12px; border-radius:12px; font-size:13px; line-height:1.6; }
+    .success { color:#17633a; } .error { color:#a52a2a; white-space:pre-wrap; }
+    details summary { cursor:pointer; font-weight:600; }
+    input[type=text] { width:100%; padding:12px; border:1px solid #bcc9d4; border-radius:10px; font-size:15px; }
+    footer { text-align:center; color:var(--muted); font-size:12px; margin-top:20px; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="logo" aria-hidden="true">☁</div>
+    <div><h1>我的備份中心</h1><div class="sub">iPhone → Google Drive｜手動選取版 A</div></div>
+  </header>
+
+  <section class="card">
+    <div class="status"><h2>1. Google Drive 連線</h2><span id="connection" class="pill warn">尚未連線</span></div>
+    <p class="sub">首次設定需要建立 Google OAuth 用戶端 ID。登入後，本頁只取得暫時存取權杖；不會把權杖儲存在本機。</p>
+    <label for="clientId" class="sub">Google OAuth 2.0 用戶端 ID（Web application）</label>
+    <input id="clientId" type="text" placeholder="例如：123456789-xxxx.apps.googleusercontent.com" autocomplete="off" autocapitalize="none" spellcheck="false">
+    <div class="row" style="margin-top:10px">
+      <button id="saveClient" class="secondary">儲存用戶端 ID</button>
+      <button id="connect">連線 Google</button>
+      <button id="disconnect" class="secondary" disabled>清除連線狀態</button>
+    </div>
+    <p class="hint">用戶端 ID 不是密碼，可以放在前端；請勿在此輸入 Client Secret。</p>
+  </section>
+
+  <section class="card">
+    <h2>2. 選取要備份的資料</h2>
+    <label class="picker">
+      <strong>📷 照片與影片</strong>
+      <span class="sub">可多選；iPhone 會開啟照片選取介面。</span>
+      <input id="mediaPicker" type="file" accept="image/*,video/*" multiple>
+    </label>
+    <label class="picker">
+      <strong>📁 文件與其他檔案</strong>
+      <span class="sub">從 iPhone「檔案」App 選取；可多選。</span>
+      <input id="docPicker" type="file" multiple>
+    </label>
+    <div class="row">
+      <button id="clearSelection" class="secondary">清除選取清單</button>
+      <span id="selectionCount" class="pill">尚未選取檔案</span>
+    </div>
+    <ul id="fileList" style="margin-top:10px"></ul>
+    <p class="hint">本頁只會上傳你在選取器中明確選取的檔案，不會掃描整個相簿或手機。</p>
+  </section>
+
+  <section class="card">
+    <div class="status"><h2>3. 執行備份</h2><span id="uploadState" class="pill">待命</span></div>
+    <p class="sub">檔案會放在 Google Drive 中由本工具建立的「iPhone 手動備份」資料夾。再次備份同名檔案時，第一版會保留兩份，不會自動覆寫。</p>
+    <button id="backup" class="full" disabled>備份所選資料到 Google Drive</button>
+    <progress id="progress" max="100" value="0" hidden></progress>
+    <div id="progressText" class="hint" aria-live="polite"></div>
+    <div id="result" style="margin-top:10px" aria-live="polite"></div>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>設定與安全說明</summary>
+      <ul style="padding-left:18px;list-style:disc;margin-top:10px">
+        <li>此版本使用 Google Drive 的 <code>drive.file</code> 範圍，目標是只管理本工具建立或由本工具開啟的檔案。</li>
+        <li>請只在自己的 HTTPS 網址使用，並確認網址正確再登入 Google。</li>
+        <li>若要公開提供其他人使用，應先完成 OAuth 同意畫面、隱私權說明及必要的 Google 驗證流程。</li>
+        <li>網頁上傳時請保持頁面開啟。iOS 可能在切換 App、鎖定螢幕或網路中斷時暫停工作。</li>
+        <li>此為第一階段原型，尚未提供自動背景備份、整個相簿自動掃描、去重、版本管理或還原精靈。</li>
+      </ul>
+    </details>
+  </section>
+  <footer>個人備份原型｜檔案只會在你明確操作後上傳</footer>
+</main>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let tokenClient = null;
+  let accessToken = null;
+  let selectedFiles = [];
+  let folderId = null;
+  let uploading = false;
+
+  const savedClientId = localStorage.getItem('iphoneDriveBackupClientId') || '';
+  $('clientId').value = savedClientId;
+
+  function humanSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+    if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
+    return (bytes/1024/1024/1024).toFixed(2) + ' GB';
+  }
+  function showResult(message, type='') {
+    $('result').className = type;
+    $('result').textContent = message;
+  }
+  function refreshSelection() {
+    $('selectionCount').textContent = selectedFiles.length ? `${selectedFiles.length} 個檔案` : '尚未選取檔案';
+    $('fileList').replaceChildren();
+    selectedFiles.forEach((file, index) => {
+      const li = document.createElement('li'); li.className = 'file';
+      const name = document.createElement('div'); name.textContent = `${index+1}. ${file.name}`;
+      const meta = document.createElement('div'); meta.className = 'filemeta'; meta.textContent = `${humanSize(file.size)} · ${file.type || '未知格式'}`;
+      li.append(name, meta); $('fileList').append(li);
+    });
+    $('backup').disabled = !accessToken || !selectedFiles.length || uploading;
+  }
+  function addFiles(list) {
+    const existing = new Set(selectedFiles.map(f => `${f.name}|${f.size}|${f.lastModified}`));
+    for (const f of list) {
+      const key = `${f.name}|${f.size}|${f.lastModified}`;
+      if (!existing.has(key)) { selectedFiles.push(f); existing.add(key); }
+    }
+    refreshSelection();
+  }
+  $('mediaPicker').addEventListener('change', e => addFiles(e.target.files));
+  $('docPicker').addEventListener('change', e => addFiles(e.target.files));
+  $('clearSelection').addEventListener('click', () => {
+    selectedFiles = []; $('mediaPicker').value=''; $('docPicker').value=''; refreshSelection(); showResult('');
+  });
+  $('saveClient').addEventListener('click', () => {
+    const id = $('clientId').value.trim();
+    if (!id || !id.includes('.apps.googleusercontent.com')) { showResult('請輸入有效格式的 Google OAuth Web 用戶端 ID。','error'); return; }
+    localStorage.setItem('iphoneDriveBackupClientId', id);
+    showResult('已儲存用戶端 ID。請按「連線 Google」。','success');
+  });
+  $('connect').addEventListener('click', () => {
+    const id = $('clientId').value.trim();
+    if (!id) { showResult('請先輸入 Google OAuth 用戶端 ID。','error'); return; }
+    if (!window.google || !google.accounts || !google.accounts.oauth2) { showResult('Google 登入元件尚未載入，請確認網路連線後重試。','error'); return; }
+    try {
+      tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: id,
+        scope: 'https://www.googleapis.com/auth/drive.file',
+        callback: async (response) => {
+          if (response.error) { showResult('Google 授權失敗：' + response.error, 'error'); return; }
+          accessToken = response.access_token;
+          $('connection').textContent = '已連線'; $('connection').className = 'pill ok';
+          $('disconnect').disabled = false;
+          $('uploadState').textContent = '已連線';
+          refreshSelection();
+          showResult('Google Drive 已連線。現在可以選取檔案並備份。','success');
+        },
+        error_callback: (error) => showResult('Google 登入視窗發生問題：' + (error.message || error.type || '未知錯誤'), 'error')
+      });
+      tokenClient.requestAccessToken({prompt: 'consent'});
+    } catch (err) { showResult('無法啟動 Google 登入：' + err.message, 'error'); }
+  });
+  $('disconnect').addEventListener('click', () => {
+    if (accessToken && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(accessToken, () => {});
+    accessToken = null; folderId = null;
+    $('connection').textContent = '尚未連線'; $('connection').className = 'pill warn';
+    $('disconnect').disabled = true; $('uploadState').textContent = '待命'; refreshSelection();
+    showResult('已清除本頁的連線狀態。');
+  });
+
+  async function apiRequest(url, options={}) {
+    const headers = new Headers(options.headers || {});
+    headers.set('Authorization', 'Bearer ' + accessToken);
+    const response = await fetch(url, {...options, headers});
+    if (!response.ok) {
+      const body = await response.text();
+      if (response.status === 401) { accessToken = null; $('connection').textContent='連線逾時'; $('connection').className='pill warn'; refreshSelection(); }
+      throw new Error(`Google API ${response.status}: ${body.slice(0,500)}`);
+    }
+    return response.status === 204 ? null : response.json();
+  }
+  async function ensureFolder() {
+    if (folderId) return folderId;
+    const query = encodeURIComponent("name = 'iPhone 手動備份' and mimeType = 'application/vnd.google-apps.folder' and trashed = false");
+    const found = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,mimeType)&pageSize=100`);
+    if (found.files && found.files.length) { folderId = found.files[0].id; return folderId; }
+    const folder = await apiRequest('https://www.googleapis.com/drive/v3/files?fields=id,name', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name:'iPhone 手動備份', mimeType:'application/vnd.google-apps.folder'})
+    });
+    folderId = folder.id; return folderId;
+  }
+  function uploadFile(file, parentId, onProgress) {
+    return new Promise((resolve, reject) => {
+      const boundary = '-------iphoneBackupBoundary' + Math.random().toString(16).slice(2);
+      const metadata = {name:file.name, mimeType:file.type || 'application/octet-stream', parents:[parentId], description:`iPhone 手動備份；原始檔案大小 ${file.size} bytes`};
+      const prefix = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n--${boundary}\r\nContent-Type: ${file.type || 'application/octet-stream'}\r\n\r\n`;
+      const suffix = `\r\n--${boundary}--`;
+      const body = new Blob([prefix, file, suffix]);
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST','https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,size,webViewLink');
+      xhr.setRequestHeader('Authorization','Bearer '+accessToken);
+      xhr.setRequestHeader('Content-Type','multipart/related; boundary='+boundary);
+      xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded/e.total); };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try { resolve(JSON.parse(xhr.responseText)); } catch(e) { reject(new Error('Google 回傳資料無法解析')); }
+        } else reject(new Error(`上傳失敗（HTTP ${xhr.status}）：${xhr.responseText.slice(0,400)}`));
+      };
+      xhr.onerror = () => reject(new Error('網路連線中斷，請確認網路後重試。'));
+      xhr.onabort = () => reject(new Error('上傳已取消。'));
+      xhr.send(body);
+    });
+  }
+  $('backup').addEventListener('click', async () => {
+    if (uploading || !accessToken || !selectedFiles.length) return;
+    uploading = true; $('backup').disabled=true; $('progress').hidden=false; $('progress').value=0;
+    $('uploadState').textContent='準備中'; showResult('');
+    let success=0; const failures=[];
+    try {
+      const parentId = await ensureFolder();
+      for (let i=0; i<selectedFiles.length; i++) {
+        const file = selectedFiles[i];
+        $('uploadState').textContent=`上傳 ${i+1}/${selectedFiles.length}`;
+        $('progressText').textContent=`正在上傳：${file.name}`;
+        try {
+          await uploadFile(file, parentId, fraction => {
+            $('progress').value=((i+fraction)/selectedFiles.length)*100;
+          });
+          success++;
+        } catch(err) { failures.push(`${file.name}：${err.message}`); }
+        $('progress').value=((i+1)/selectedFiles.length)*100;
+      }
+      $('uploadState').textContent=failures.length ? '部分完成' : '完成';
+      if (failures.length) showResult(`完成 ${success} 個；失敗 ${failures.length} 個。\n`+failures.join('\n'),'error');
+      else showResult(`備份完成！共上傳 ${success} 個檔案至 Google Drive「iPhone 手動備份」資料夾。`,'success');
+      $('progressText').textContent='上傳工作已結束。';
+    } catch(err) {
+      $('uploadState').textContent='失敗'; showResult('備份準備失敗：'+err.message,'error');
+    } finally {
+      uploading=false; refreshSelection();
+    }
+  });
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+  }
+  refreshSelection();
+})();
+</script>
+</body>
+</html>
