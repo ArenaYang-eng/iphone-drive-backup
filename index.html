@@ -100,6 +100,16 @@
         <li>尚無備份紀錄</li>
       </ul>
     </div>
+        <!-- 新增：雲端檔案清單區塊 -->
+    <div style="margin-top:20px; border-top:1px solid #edf0f3; padding-top:15px;">
+      <div class="status">
+        <h3 style="font-size:15px; margin:0 0 10px; color:var(--ink);">☁️ 雲端備份清單</h3>
+        <button id="loadCloudFiles" class="secondary" style="min-height:32px; padding:6px 12px; font-size:13px;">重新整理</button>
+      </div>
+      <ul id="cloudFileList" style="font-size:13px; color:var(--muted); max-height: 300px; overflow-y: auto;">
+        <li>請先連線 Google 並點擊「重新整理」載入清單。</li>
+      </ul>
+    </div>
   </section>
 
   <section class="card">
@@ -121,7 +131,7 @@
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (() => {
-  const APP_VERSION = 'v2.1';
+  const APP_VERSION = 'v3.0';
   const $ = id => document.getElementById(id);
   
   // 顯示版本號
@@ -204,6 +214,90 @@
     localStorage.setItem('iphoneBackupHistory', JSON.stringify(trimmedHistory));
     loadBackupHistory();
   }
+  // 1. 載入雲端檔案清單
+  async function loadCloudFiles() {
+    if (!accessToken) {
+      showResult('請先連線 Google 才能讀取雲端清單。', 'error');
+      return;
+    }
+    
+    const listEl = $('cloudFileList');
+    listEl.innerHTML = '<li>載入中...</li>';
+    
+    try {
+      // 先找到根目錄「iPhone 手動備份」
+      const rootFolderId = await getOrCreateFolder('iPhone 手動備份');
+      
+      // 查詢該資料夾下的所有檔案 (限制 50 筆以免卡頓)
+      const query = `'${rootFolderId}' in parents and trashed = false`;
+      const res = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,size,mimeType,createdTime)&pageSize=50&orderBy=createdTime desc`);
+      
+      if (!res.files || res.files.length === 0) {
+        listEl.innerHTML = '<li>雲端尚無備份檔案。</li>';
+        return;
+      }
+
+      listEl.innerHTML = '';
+      res.files.forEach(file => {
+        const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
+        const sizeStr = file.size ? humanSize(Number(file.size)) : (isFolder ? '資料夾' : '');
+        const dateStr = new Date(file.createdTime).toLocaleDateString('zh-TW');
+        
+        const li = document.createElement('li');
+        li.style.cssText = 'padding:8px 0; border-bottom:1px dashed #eee; display:flex; justify-content:space-between; align-items:center;';
+        
+        // 左側：檔名與資訊
+        const infoDiv = document.createElement('div');
+        infoDiv.innerHTML = `<strong style="color:var(--ink);">${isFolder ? '📁' : '📄'} ${file.name}</strong><br><span style="font-size:11px;">${dateStr} · ${sizeStr}</span>`;
+        
+        // 右側：下載按鈕 (資料夾不提供下載)
+        const actionDiv = document.createElement('div');
+        if (!isFolder) {
+          const btn = document.createElement('button');
+          btn.textContent = '下載';
+          btn.className = 'secondary';
+          btn.style.cssText = 'min-height:28px; padding:4px 10px; font-size:12px;';
+          btn.onclick = () => downloadFile(file.id, file.name);
+          actionDiv.appendChild(btn);
+        }
+        
+        li.appendChild(infoDiv);
+        li.appendChild(actionDiv);
+        listEl.appendChild(li);
+      });
+    } catch (err) {
+      listEl.innerHTML = `<li class="error">載入失敗：${err.message}</li>`;
+    }
+  }
+
+  // 2. 下載檔案 (還原至手機)
+  async function downloadFile(fileId, fileName) {
+    try {
+      showResult(`正在準備下載：${fileName}...`, 'success');
+      
+      // 使用 alt=media 取得實體檔案
+      const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+        headers: { 'Authorization': 'Bearer ' + accessToken }
+      });
+      
+      if (!response.ok) throw new Error(`下載失敗 (HTTP ${response.status})`);
+      
+      const blob = await response.blob();
+      // 在 iOS Safari 上，這會觸發系統的「下載 / 分享」選單
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      
+      showResult(`已觸發下載：${fileName}`, 'success');
+    } catch (err) {
+      showResult(`下載失敗：${err.message}`, 'error');
+    }
+  }
 
   // 事件綁定
   if ($('mediaPicker')) $('mediaPicker').addEventListener('change', e => addFiles(e.target.files));
@@ -249,6 +343,8 @@
             $('uploadState').textContent = '已連線';
             refreshSelection();
             showResult('Google Drive 已連線。現在可以選取檔案並備份。','success');
+           // 👇 新增這行：連線成功後自動抓取清單
+            loadCloudFiles();
           },
           error_callback: (error) => showResult('Google 登入視窗發生問題：' + (error.message || error.type || '未知錯誤'), 'error')
         });
@@ -265,6 +361,9 @@
       $('disconnect').disabled = true; $('uploadState').textContent = '待命'; refreshSelection();
       showResult('已清除本頁的連線狀態。');
     });
+  }
+    if ($('loadCloudFiles')) {
+    $('loadCloudFiles').addEventListener('click', loadCloudFiles);
   }
 
   async function apiRequest(url, options={}) {
