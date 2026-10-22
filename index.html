@@ -55,6 +55,7 @@
       <button id="connect">連線 Google</button>
       <button id="disconnect" class="secondary" disabled>清除連線狀態</button>
     </div>
+    <div id="saveResult" style="margin-top:10px; font-size:14px;" aria-live="polite"></div>
     <p class="hint">用戶端 ID 不是密碼，可以放在前端；請勿在此輸入 Client Secret。</p>
   </section>
 
@@ -80,7 +81,7 @@
 
   <section class="card">
     <div class="status"><h2>3. 執行備份</h2><span id="uploadState" class="pill">待命</span></div>
-    <p class="sub">檔案會放在 Google Drive 中由本工具建立的「iPhone 手動備份」資料夾。再次備份同名檔案時，第一版會保留兩份，不會自動覆寫。</p>
+    <p class="sub">檔案會依拍攝時間自動分類到「年份/月份」資料夾。若已有同名檔案，系統會自動跳過。</p>
     <button id="backup" class="full" disabled>備份所選資料到 Google Drive</button>
     <progress id="progress" max="100" value="0" hidden></progress>
     <div id="progressText" class="hint" aria-live="polite"></div>
@@ -95,7 +96,7 @@
         <li>請只在自己的 HTTPS 網址使用，並確認網址正確再登入 Google。</li>
         <li>若要公開提供其他人使用，應先完成 OAuth 同意畫面、隱私權說明及必要的 Google 驗證流程。</li>
         <li>網頁上傳時請保持頁面開啟。iOS 可能在切換 App、鎖定螢幕或網路中斷時暫停工作。</li>
-        <li>此為第一階段原型，尚未提供自動背景備份、整個相簿自動掃描、去重、版本管理或還原精靈。</li>
+        <li>此為第二階段版本，已支援時間分類、失敗重試與跳過重複檔案。</li>
       </ul>
     </details>
   </section>
@@ -103,7 +104,6 @@
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/exifr/dist/full.umd.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/exifr/dist/full.umd.js"></script>  
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (() => {
@@ -151,12 +151,20 @@
   $('clearSelection').addEventListener('click', () => {
     selectedFiles = []; $('mediaPicker').value=''; $('docPicker').value=''; refreshSelection(); showResult('');
   });
+  
   $('saveClient').addEventListener('click', () => {
     const id = $('clientId').value.trim();
-    if (!id || !id.includes('.apps.googleusercontent.com')) { showResult('請輸入有效格式的 Google OAuth Web 用戶端 ID。','error'); return; }
+    const msgEl = $('saveResult');
+    if (!id || !id.includes('.apps.googleusercontent.com')) { 
+      msgEl.className = 'error';
+      msgEl.textContent = '請輸入有效格式的 Google OAuth Web 用戶端 ID。'; 
+      return; 
+    }
     localStorage.setItem('iphoneDriveBackupClientId', id);
-    showResult('已儲存用戶端 ID。請按「連線 Google」。','success');
+    msgEl.className = 'success';
+    msgEl.textContent = '已儲存用戶端 ID。請按「連線 Google」。';
   });
+
   $('connect').addEventListener('click', () => {
     const id = $('clientId').value.trim();
     if (!id) { showResult('請先輸入 Google OAuth 用戶端 ID。','error'); return; }
@@ -179,6 +187,7 @@
       tokenClient.requestAccessToken({prompt: 'consent'});
     } catch (err) { showResult('無法啟動 Google 登入：' + err.message, 'error'); }
   });
+
   $('disconnect').addEventListener('click', () => {
     if (accessToken && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(accessToken, () => {});
     accessToken = null; folderId = null;
@@ -198,16 +207,14 @@
     }
     return response.status === 204 ? null : response.json();
   }
-  // 1. 通用：取得或建立指定名稱的資料夾
+
   async function getOrCreateFolder(folderName, parentId = null) {
     let query = `name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
     if (parentId) query += ` and '${parentId}' in parents`;
     
-    // 先搜尋是否已存在
     const found = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=1`);
     if (found.files && found.files.length > 0) return found.files[0].id;
 
-    // 不存在則建立
     const metadata = { name: folderName, mimeType: 'application/vnd.google-apps.folder' };
     if (parentId) metadata.parents = [parentId];
     
@@ -219,62 +226,51 @@
     return folder.id;
   }
 
-  // 2. 解析 EXIF 並決定該檔案要去的目標資料夾
-   async function getTargetFolder(file, rootFolderId) {
-    // 如果檔案不是圖片（例如影片、文件），統一放到「其他檔案」
+  async function getTargetFolder(file, rootFolderId) {
     if (!file.type.startsWith('image/')) {
       return await getOrCreateFolder('其他檔案', rootFolderId);
     }
 
     try {
-      // 使用 exifr 讀取拍攝時間
       const exif = await exifr.parse(file, ['DateTimeOriginal']);
       if (exif && exif.DateTimeOriginal) {
         const date = new Date(exif.DateTimeOriginal);
         const yearStr = date.getFullYear().toString();
         const monthStr = (date.getMonth() + 1).toString().padStart(2, '0') + '月';
         
-        // 建立「年份」資料夾，再建立「月份」資料夾
         const yearFolderId = await getOrCreateFolder(yearStr, rootFolderId);
         return await getOrCreateFolder(monthStr, yearFolderId);
       }
     } catch (e) {
       console.warn('無法讀取 EXIF 時間:', e);
     }
-    
-    // 如果沒有 EXIF 時間（例如截圖、下載的圖片），放到「未分類照片」
     return await getOrCreateFolder('未分類照片', rootFolderId);
   }
-    // 1. 帶有重試機制與完整性檢查的上傳函式
+
   async function uploadFileWithRetry(file, parentId, onProgress, maxRetries = 3) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         const result = await uploadFile(file, parentId, onProgress);
-        // 完整性檢查：比對回傳的 size 與本地檔案 size
         if (result.size && Number(result.size) !== file.size) {
           throw new Error(`檔案大小不符 (本地: ${file.size}, 雲端: ${result.size})`);
         }
-        return result; // 成功則回傳
+        return result;
       } catch (err) {
         console.warn(`第 ${attempt} 次上傳失敗:`, err);
         if (attempt === maxRetries) throw new Error(`重試 ${maxRetries} 次後仍失敗: ${err.message}`);
-        
-        // 等待 2 秒後重試
         await new Promise(resolve => setTimeout(resolve, 2000));
-        if(onProgress) onProgress(0); // 重試時進度條歸零
+        if(onProgress) onProgress(0);
       }
     }
   }
 
-  // 2. 檢查資料夾內是否已有同名檔案 (去重)
   async function checkFileExists(fileName, parentId) {
-    // 處理檔名中可能包含單引號的狀況，避免 API 查詢語法錯誤
     const safeName = fileName.replace(/'/g, "\\'");
     const query = `name = '${safeName}' and '${parentId}' in parents and trashed = false`;
-    
     const res = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=1`);
     return res.files && res.files.length > 0;
   }
+
   function uploadFile(file, parentId, onProgress) {
     return new Promise((resolve, reject) => {
       const boundary = '-------iphoneBackupBoundary' + Math.random().toString(16).slice(2);
@@ -297,11 +293,13 @@
       xhr.send(body);
     });
   }
+
   $('backup').addEventListener('click', async () => {
     if (uploading || !accessToken || !selectedFiles.length) return;
     uploading = true; $('backup').disabled=true; $('progress').hidden=false; $('progress').value=0;
     $('uploadState').textContent='準備中'; showResult('');
-        let success=0; const skipped=[]; const failures=[];
+    
+    let success=0; const skipped=[]; const failures=[];
     try {
       const rootFolderId = await getOrCreateFolder('iPhone 手動備份');
       
@@ -310,11 +308,9 @@
         $('uploadState').textContent=`處理中 ${i+1}/${selectedFiles.length}`;
         
         try {
-          // 1. 取得目標資料夾
           $('progressText').textContent=`分析分類：${file.name}`;
           const targetFolderId = await getTargetFolder(file, rootFolderId);
           
-          // 2. 去重檢查：如果檔案已存在，直接跳過
           $('progressText').textContent=`檢查是否重複：${file.name}`;
           const isDuplicate = await checkFileExists(file.name, targetFolderId);
           
@@ -322,7 +318,6 @@
             skipped.push(file.name);
             console.log(`跳過重複檔案: ${file.name}`);
           } else {
-            // 3. 開始上傳（使用重試機制）
             $('progressText').textContent=`正在上傳：${file.name}`;
             await uploadFileWithRetry(file, targetFolderId, fraction => {
               $('progress').value=((i+fraction)/selectedFiles.length)*100;
@@ -334,8 +329,8 @@
         }
         $('progress').value=((i+1)/selectedFiles.length)*100;
       }
-            $('uploadState').textContent=failures.length ? '部分完成' : '完成';
       
+      $('uploadState').textContent=failures.length ? '部分完成' : '完成';
       let resultMsg = `備份完成！\n成功上傳：${success} 個`;
       if (skipped.length > 0) resultMsg += `\n跳過重複：${skipped.length} 個`;
       if (failures.length > 0) resultMsg += `\n失敗：${failures.length} 個\n` + failures.join('\n');
@@ -348,11 +343,8 @@
       uploading=false; refreshSelection();
     }
   });
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
-    window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
-  }
-  refreshSelection();
-    // --- PWA 版本自動更新偵測 ---
+
+  // --- PWA 版本自動更新偵測 ---
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('./sw.js').then(reg => {
@@ -360,7 +352,6 @@
           const newWorker = reg.installing;
           newWorker.onstatechange = () => {
             if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-              // 跳出更新提示
               if (confirm('發現新版本！是否立即重新整理以套用更新？')) {
                 newWorker.postMessage({ action: 'skipWaiting' });
                 window.location.reload();
@@ -371,6 +362,8 @@
       }).catch(err => console.error('SW註冊失敗:', err));
     });
   }
+  
+  refreshSelection();
 })();
 </script>
 </body>
