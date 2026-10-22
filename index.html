@@ -106,6 +106,9 @@
         <h3 style="font-size:15px; margin:0 0 10px; color:var(--ink);">☁️ 雲端備份清單</h3>
         <button id="loadCloudFiles" class="secondary" style="min-height:32px; padding:6px 12px; font-size:13px;">重新整理</button>
       </div>
+            <!-- 新增：路徑導航顯示 -->
+      <div id="folderBreadcrumb" style="margin-bottom:10px; font-size:12px; color:var(--muted);"></div>
+      
       <ul id="cloudFileList" style="font-size:13px; color:var(--muted); max-height: 300px; overflow-y: auto;">
         <li>請先連線 Google 並點擊「重新整理」載入清單。</li>
       </ul>
@@ -131,7 +134,7 @@
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (() => {
-  const APP_VERSION = 'v3.0';
+  const APP_VERSION = 'v3.1';
   const $ = id => document.getElementById(id);
   
   // 顯示版本號
@@ -215,54 +218,97 @@
     loadBackupHistory();
   }
   // 1. 載入雲端檔案清單
-  async function loadCloudFiles() {
+    // 記錄目前所在的資料夾路徑 (用於返回上一層)
+  let folderHistory = [];
+
+  async function loadCloudFiles(targetId = null, targetName = '') {
     if (!accessToken) {
       showResult('請先連線 Google 才能讀取雲端清單。', 'error');
       return;
     }
     
     const listEl = $('cloudFileList');
+    const crumbEl = $('folderBreadcrumb');
     listEl.innerHTML = '<li>載入中...</li>';
     
     try {
-      // 先找到根目錄「iPhone 手動備份」
-      const rootFolderId = await getOrCreateFolder('iPhone 手動備份');
+      let currentId = targetId;
       
-      // 查詢該資料夾下的所有檔案 (限制 50 筆以免卡頓)
-      const query = `'${rootFolderId}' in parents and trashed = false`;
-      const res = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,size,mimeType,createdTime)&pageSize=50&orderBy=createdTime desc`);
+      // 1. 處理路徑歷史紀錄
+      if (!currentId) {
+        // 初次載入：先找根目錄
+        currentId = await getOrCreateFolder('iPhone 手動備份');
+        folderHistory = [{ id: currentId, name: 'iPhone 手動備份' }];
+      } else {
+        // 點擊進入資料夾或返回
+        const existingIdx = folderHistory.findIndex(f => f.id === currentId);
+        if (existingIdx !== -1) {
+          // 如果是返回上一層，截斷後面的歷史
+          folderHistory = folderHistory.slice(0, existingIdx + 1);
+        } else {
+          // 如果是進入新資料夾，加到歷史中
+          folderHistory.push({ id: currentId, name: targetName });
+        }
+      }
+      
+      // 2. 更新導航 UI (顯示返回按鈕與目前路徑)
+      if (crumbEl) {
+        let crumbHtml = '';
+        if (folderHistory.length > 1) {
+          crumbHtml = `<button id="btnGoBack" class="secondary" style="min-height:28px; padding:4px 8px; font-size:12px; margin-bottom:8px;">🔙 返回上一層</button><br>`;
+        }
+        crumbHtml += `<span style="font-weight:bold; color:var(--ink);">📍 目前位置：${folderHistory.map(f=>f.name).join(' / ')}</span>`;
+        crumbEl.innerHTML = crumbHtml;
+        
+        if (folderHistory.length > 1) {
+          $('btnGoBack').onclick = () => {
+             const prevFolder = folderHistory[folderHistory.length - 2];
+             loadCloudFiles(prevFolder.id, prevFolder.name);
+          };
+        }
+      }
+
+      // 3. 查詢目標資料夾下的檔案 (加上 orderBy=folder 讓資料夾排在最前面)
+      const query = `'${currentId}' in parents and trashed = false`;
+      const res = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,size,mimeType,createdTime)&pageSize=100&orderBy=folder,createdTime desc`);
       
       if (!res.files || res.files.length === 0) {
-        listEl.innerHTML = '<li>雲端尚無備份檔案。</li>';
+        listEl.innerHTML = '<li>此資料夾內尚無檔案。</li>';
         return;
       }
 
+      // 4. 渲染清單
       listEl.innerHTML = '';
       res.files.forEach(file => {
         const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
-        const sizeStr = file.size ? humanSize(Number(file.size)) : (isFolder ? '資料夾' : '');
+        const sizeStr = file.size ? humanSize(Number(file.size)) : '';
         const dateStr = new Date(file.createdTime).toLocaleDateString('zh-TW');
         
         const li = document.createElement('li');
         li.style.cssText = 'padding:8px 0; border-bottom:1px dashed #eee; display:flex; justify-content:space-between; align-items:center;';
         
-        // 左側：檔名與資訊
         const infoDiv = document.createElement('div');
-        infoDiv.innerHTML = `<strong style="color:var(--ink);">${isFolder ? '📁' : '📄'} ${file.name}</strong><br><span style="font-size:11px;">${dateStr} · ${sizeStr}</span>`;
         
-        // 右側：下載按鈕 (資料夾不提供下載)
-        const actionDiv = document.createElement('div');
-        if (!isFolder) {
-          const btn = document.createElement('button');
-          btn.textContent = '下載';
-          btn.className = 'secondary';
-          btn.style.cssText = 'min-height:28px; padding:4px 10px; font-size:12px;';
-          btn.onclick = () => downloadFile(file.id, file.name);
-          actionDiv.appendChild(btn);
+        if (isFolder) {
+           // 如果它是資料夾，讓它變成藍色且可以點擊
+           infoDiv.innerHTML = `<strong style="color:var(--blue); cursor:pointer;">📁 ${file.name}</strong><br><span style="font-size:11px;">${dateStr}</span>`;
+           infoDiv.onclick = () => loadCloudFiles(file.id, file.name);
+           li.appendChild(infoDiv);
+        } else {
+           // 如果它是檔案，顯示下載按鈕
+           infoDiv.innerHTML = `<strong style="color:var(--ink);">📄 ${file.name}</strong><br><span style="font-size:11px;">${dateStr} · ${sizeStr}</span>`;
+           
+           const actionDiv = document.createElement('div');
+           const btn = document.createElement('button');
+           btn.textContent = '下載';
+           btn.className = 'secondary';
+           btn.style.cssText = 'min-height:28px; padding:4px 10px; font-size:12px;';
+           btn.onclick = () => downloadFile(file.id, file.name);
+           actionDiv.appendChild(btn);
+           
+           li.appendChild(infoDiv);
+           li.appendChild(actionDiv);
         }
-        
-        li.appendChild(infoDiv);
-        li.appendChild(actionDiv);
         listEl.appendChild(li);
       });
     } catch (err) {
