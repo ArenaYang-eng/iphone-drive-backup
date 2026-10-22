@@ -245,6 +245,36 @@
     // 如果沒有 EXIF 時間（例如截圖、下載的圖片），放到「未分類照片」
     return await getOrCreateFolder('未分類照片', rootFolderId);
   }
+    // 1. 帶有重試機制與完整性檢查的上傳函式
+  async function uploadFileWithRetry(file, parentId, onProgress, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const result = await uploadFile(file, parentId, onProgress);
+        // 完整性檢查：比對回傳的 size 與本地檔案 size
+        if (result.size && Number(result.size) !== file.size) {
+          throw new Error(`檔案大小不符 (本地: ${file.size}, 雲端: ${result.size})`);
+        }
+        return result; // 成功則回傳
+      } catch (err) {
+        console.warn(`第 ${attempt} 次上傳失敗:`, err);
+        if (attempt === maxRetries) throw new Error(`重試 ${maxRetries} 次後仍失敗: ${err.message}`);
+        
+        // 等待 2 秒後重試
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        if(onProgress) onProgress(0); // 重試時進度條歸零
+      }
+    }
+  }
+
+  // 2. 檢查資料夾內是否已有同名檔案 (去重)
+  async function checkFileExists(fileName, parentId) {
+    // 處理檔名中可能包含單引號的狀況，避免 API 查詢語法錯誤
+    const safeName = fileName.replace(/'/g, "\\'");
+    const query = `name = '${safeName}' and '${parentId}' in parents and trashed = false`;
+    
+    const res = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=1`);
+    return res.files && res.files.length > 0;
+  }
   function uploadFile(file, parentId, onProgress) {
     return new Promise((resolve, reject) => {
       const boundary = '-------iphoneBackupBoundary' + Math.random().toString(16).slice(2);
@@ -271,32 +301,46 @@
     if (uploading || !accessToken || !selectedFiles.length) return;
     uploading = true; $('backup').disabled=true; $('progress').hidden=false; $('progress').value=0;
     $('uploadState').textContent='準備中'; showResult('');
-        let success=0; const failures=[];
+        let success=0; const skipped=[]; const failures=[];
     try {
-      // 1. 先確保根目錄「iPhone 手動備份」存在
       const rootFolderId = await getOrCreateFolder('iPhone 手動備份');
       
       for (let i=0; i<selectedFiles.length; i++) {
         const file = selectedFiles[i];
         $('uploadState').textContent=`處理中 ${i+1}/${selectedFiles.length}`;
         
-        // 2. 計算該檔案的目的地（依照時間分類）
-        $('progressText').textContent=`正在分析檔案時間：${file.name}`;
-        const targetFolderId = await getTargetFolder(file, rootFolderId);
-        
-        // 3. 開始上傳
-        $('progressText').textContent=`正在上傳：${file.name}`;
         try {
-          await uploadFile(file, targetFolderId, fraction => {
-            $('progress').value=((i+fraction)/selectedFiles.length)*100;
-          });
-          success++;
-        } catch(err) { failures.push(`${file.name}：${err.message}`); }
+          // 1. 取得目標資料夾
+          $('progressText').textContent=`分析分類：${file.name}`;
+          const targetFolderId = await getTargetFolder(file, rootFolderId);
+          
+          // 2. 去重檢查：如果檔案已存在，直接跳過
+          $('progressText').textContent=`檢查是否重複：${file.name}`;
+          const isDuplicate = await checkFileExists(file.name, targetFolderId);
+          
+          if (isDuplicate) {
+            skipped.push(file.name);
+            console.log(`跳過重複檔案: ${file.name}`);
+          } else {
+            // 3. 開始上傳（使用重試機制）
+            $('progressText').textContent=`正在上傳：${file.name}`;
+            await uploadFileWithRetry(file, targetFolderId, fraction => {
+              $('progress').value=((i+fraction)/selectedFiles.length)*100;
+            });
+            success++;
+          }
+        } catch(err) { 
+          failures.push(`${file.name}：${err.message}`); 
+        }
         $('progress').value=((i+1)/selectedFiles.length)*100;
       }
-      $('uploadState').textContent=failures.length ? '部分完成' : '完成';
-      if (failures.length) showResult(`完成 ${success} 個；失敗 ${failures.length} 個。\n`+failures.join('\n'),'error');
-      else showResult(`備份完成！共上傳 ${success} 個檔案至 Google Drive「iPhone 手動備份」資料夾。`,'success');
+            $('uploadState').textContent=failures.length ? '部分完成' : '完成';
+      
+      let resultMsg = `備份完成！\n成功上傳：${success} 個`;
+      if (skipped.length > 0) resultMsg += `\n跳過重複：${skipped.length} 個`;
+      if (failures.length > 0) resultMsg += `\n失敗：${failures.length} 個\n` + failures.join('\n');
+      
+      showResult(resultMsg, failures.length ? 'error' : 'success');
       $('progressText').textContent='上傳工作已結束。';
     } catch(err) {
       $('uploadState').textContent='失敗'; showResult('備份準備失敗：'+err.message,'error');
