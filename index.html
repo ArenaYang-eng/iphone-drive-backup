@@ -40,15 +40,14 @@
 </head>
 <body>
 <main>
-    <header>
+  <header>
     <div class="logo" aria-hidden="true">☁</div>
     <div style="flex:1; display:flex; justify-content:space-between; align-items:flex-start;">
       <div>
         <h1>我的備份中心</h1>
         <div class="sub">iPhone → Google Drive｜手動選取版 A</div>
       </div>
-      <!-- 新增版本號標籤 -->
-      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v2.0</span>
+      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v2.1</span>
     </div>
   </header>
 
@@ -93,6 +92,14 @@
     <progress id="progress" max="100" value="0" hidden></progress>
     <div id="progressText" class="hint" aria-live="polite"></div>
     <div id="result" style="margin-top:10px" aria-live="polite"></div>
+    
+    <!-- 歷史紀錄區塊 -->
+    <div style="margin-top:20px; border-top:1px solid #edf0f3; padding-top:15px;">
+      <h3 style="font-size:15px; margin:0 0 10px; color:var(--ink);">📜 最近備份紀錄</h3>
+      <ul id="historyList" style="font-size:13px; color:var(--muted);">
+        <li>尚無備份紀錄</li>
+      </ul>
+    </div>
   </section>
 
   <section class="card">
@@ -103,7 +110,7 @@
         <li>請只在自己的 HTTPS 網址使用，並確認網址正確再登入 Google。</li>
         <li>若要公開提供其他人使用，應先完成 OAuth 同意畫面、隱私權說明及必要的 Google 驗證流程。</li>
         <li>網頁上傳時請保持頁面開啟。iOS 可能在切換 App、鎖定螢幕或網路中斷時暫停工作。</li>
-        <li>此為第二階段版本，已支援時間分類、失敗重試與跳過重複檔案。</li>
+        <li>此為第二階段版本，已支援時間分類、失敗重試、跳過重複檔案與備份歷史紀錄。</li>
       </ul>
     </details>
   </section>
@@ -114,12 +121,13 @@
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (() => {
-  (() => {
-  const APP_VERSION = 'v2.0'; // 👈 在未來更新時，只需修改此處
-  const $ = (id) => document.getElementById(id);
+  const APP_VERSION = 'v2.1';
   const $ = id => document.getElementById(id);
-  // 👇 2. 在這裡將版本號寫入剛剛添加的 HTML 標籤中
-    document.getElementById('versionDisplay').textContent = APP_VERSION;
+  
+  // 顯示版本號
+  const verEl = $('versionDisplay');
+  if (verEl) verEl.textContent = APP_VERSION;
+
   let tokenClient = null;
   let accessToken = null;
   let selectedFiles = [];
@@ -127,7 +135,7 @@
   let uploading = false;
 
   const savedClientId = localStorage.getItem('iphoneDriveBackupClientId') || '';
-  $('clientId').value = savedClientId;
+  if ($('clientId')) $('clientId').value = savedClientId;
 
   function humanSize(bytes) {
     if (bytes < 1024) return bytes + ' B';
@@ -135,11 +143,16 @@
     if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
     return (bytes/1024/1024/1024).toFixed(2) + ' GB';
   }
+  
   function showResult(message, type='') {
-    $('result').className = type;
-    $('result').textContent = message;
+    if ($('result')) {
+      $('result').className = type;
+      $('result').textContent = message;
+    }
   }
+  
   function refreshSelection() {
+    if (!$('selectionCount')) return;
     $('selectionCount').textContent = selectedFiles.length ? `${selectedFiles.length} 個檔案` : '尚未選取檔案';
     $('fileList').replaceChildren();
     selectedFiles.forEach((file, index) => {
@@ -150,6 +163,7 @@
     });
     $('backup').disabled = !accessToken || !selectedFiles.length || uploading;
   }
+  
   function addFiles(list) {
     const existing = new Set(selectedFiles.map(f => `${f.name}|${f.size}|${f.lastModified}`));
     for (const f of list) {
@@ -158,55 +172,100 @@
     }
     refreshSelection();
   }
-  $('mediaPicker').addEventListener('change', e => addFiles(e.target.files));
-  $('docPicker').addEventListener('change', e => addFiles(e.target.files));
-  $('clearSelection').addEventListener('click', () => {
-    selectedFiles = []; $('mediaPicker').value=''; $('docPicker').value=''; refreshSelection(); showResult('');
-  });
-  
-  $('saveClient').addEventListener('click', () => {
-    const id = $('clientId').value.trim();
-    const msgEl = $('saveResult');
-    if (!id || !id.includes('.apps.googleusercontent.com')) { 
-      msgEl.className = 'error';
-      msgEl.textContent = '請輸入有效格式的 Google OAuth Web 用戶端 ID。'; 
-      return; 
+
+  // 載入並顯示歷史紀錄
+  function loadBackupHistory() {
+    if (!$('historyList')) return;
+    const history = JSON.parse(localStorage.getItem('iphoneBackupHistory') || '[]');
+    const list = $('historyList');
+    
+    if (history.length === 0) {
+      list.innerHTML = '<li>尚無備份紀錄</li>';
+      return;
     }
-    localStorage.setItem('iphoneDriveBackupClientId', id);
-    msgEl.className = 'success';
-    msgEl.textContent = '已儲存用戶端 ID。請按「連線 Google」。';
-  });
+    
+    list.innerHTML = history.map(item => 
+      `<li style="margin-bottom:6px; border-bottom:1px dashed #eee; padding-bottom:4px;">
+        <strong>${item.time}</strong><br>
+        成功: ${item.success} | 跳過: ${item.skipped} | 失敗: ${item.failures}
+      </li>`
+    ).join('');
+  }
 
-  $('connect').addEventListener('click', () => {
-    const id = $('clientId').value.trim();
-    if (!id) { showResult('請先輸入 Google OAuth 用戶端 ID。','error'); return; }
-    if (!window.google || !google.accounts || !google.accounts.oauth2) { showResult('Google 登入元件尚未載入，請確認網路連線後重試。','error'); return; }
-    try {
-      tokenClient = google.accounts.oauth2.initTokenClient({
-        client_id: id,
-        scope: 'https://www.googleapis.com/auth/drive.file',
-        callback: async (response) => {
-          if (response.error) { showResult('Google 授權失敗：' + response.error, 'error'); return; }
-          accessToken = response.access_token;
-          $('connection').textContent = '已連線'; $('connection').className = 'pill ok';
-          $('disconnect').disabled = false;
-          $('uploadState').textContent = '已連線';
-          refreshSelection();
-          showResult('Google Drive 已連線。現在可以選取檔案並備份。','success');
-        },
-        error_callback: (error) => showResult('Google 登入視窗發生問題：' + (error.message || error.type || '未知錯誤'), 'error')
-      });
-      tokenClient.requestAccessToken({prompt: 'consent'});
-    } catch (err) { showResult('無法啟動 Google 登入：' + err.message, 'error'); }
-  });
+  // 儲存歷史紀錄
+  function saveBackupHistory(success, skipped, failures) {
+    const history = JSON.parse(localStorage.getItem('iphoneBackupHistory') || '[]');
+    const now = new Date();
+    const timeStr = `${now.getMonth()+1}/${now.getDate()} ${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`;
+    
+    history.unshift({ time: timeStr, success, skipped: skipped.length, failures: failures.length });
+    const trimmedHistory = history.slice(0, 5); // 只保留最近 5 筆
+    
+    localStorage.setItem('iphoneBackupHistory', JSON.stringify(trimmedHistory));
+    loadBackupHistory();
+  }
 
-  $('disconnect').addEventListener('click', () => {
-    if (accessToken && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(accessToken, () => {});
-    accessToken = null; folderId = null;
-    $('connection').textContent = '尚未連線'; $('connection').className = 'pill warn';
-    $('disconnect').disabled = true; $('uploadState').textContent = '待命'; refreshSelection();
-    showResult('已清除本頁的連線狀態。');
-  });
+  // 事件綁定
+  if ($('mediaPicker')) $('mediaPicker').addEventListener('change', e => addFiles(e.target.files));
+  if ($('docPicker')) $('docPicker').addEventListener('change', e => addFiles(e.target.files));
+  
+  if ($('clearSelection')) {
+    $('clearSelection').addEventListener('click', () => {
+      selectedFiles = []; 
+      if ($('mediaPicker')) $('mediaPicker').value=''; 
+      if ($('docPicker')) $('docPicker').value=''; 
+      refreshSelection(); 
+      showResult('');
+    });
+  }
+  
+  if ($('saveClient')) {
+    $('saveClient').addEventListener('click', () => {
+      const id = $('clientId').value.trim();
+      const msgEl = $('saveResult');
+      if (!id || !id.includes('.apps.googleusercontent.com')) { 
+        if(msgEl) { msgEl.className = 'error'; msgEl.textContent = '請輸入有效格式的 Google OAuth Web 用戶端 ID。'; }
+        return; 
+      }
+      localStorage.setItem('iphoneDriveBackupClientId', id);
+      if(msgEl) { msgEl.className = 'success'; msgEl.textContent = '已儲存用戶端 ID。請按「連線 Google」。'; }
+    });
+  }
+
+  if ($('connect')) {
+    $('connect').addEventListener('click', () => {
+      const id = $('clientId').value.trim();
+      if (!id) { showResult('請先輸入 Google OAuth 用戶端 ID。','error'); return; }
+      if (!window.google || !google.accounts || !google.accounts.oauth2) { showResult('Google 登入元件尚未載入，請確認網路連線後重試。','error'); return; }
+      try {
+        tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: id,
+          scope: 'https://www.googleapis.com/auth/drive.file',
+          callback: async (response) => {
+            if (response.error) { showResult('Google 授權失敗：' + response.error, 'error'); return; }
+            accessToken = response.access_token;
+            $('connection').textContent = '已連線'; $('connection').className = 'pill ok';
+            $('disconnect').disabled = false;
+            $('uploadState').textContent = '已連線';
+            refreshSelection();
+            showResult('Google Drive 已連線。現在可以選取檔案並備份。','success');
+          },
+          error_callback: (error) => showResult('Google 登入視窗發生問題：' + (error.message || error.type || '未知錯誤'), 'error')
+        });
+        tokenClient.requestAccessToken({prompt: 'consent'});
+      } catch (err) { showResult('無法啟動 Google 登入：' + err.message, 'error'); }
+    });
+  }
+
+  if ($('disconnect')) {
+    $('disconnect').addEventListener('click', () => {
+      if (accessToken && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(accessToken, () => {});
+      accessToken = null; folderId = null;
+      $('connection').textContent = '尚未連線'; $('connection').className = 'pill warn';
+      $('disconnect').disabled = true; $('uploadState').textContent = '待命'; refreshSelection();
+      showResult('已清除本頁的連線狀態。');
+    });
+  }
 
   async function apiRequest(url, options={}) {
     const headers = new Headers(options.headers || {});
@@ -242,14 +301,12 @@
     if (!file.type.startsWith('image/')) {
       return await getOrCreateFolder('其他檔案', rootFolderId);
     }
-
     try {
       const exif = await exifr.parse(file, ['DateTimeOriginal']);
       if (exif && exif.DateTimeOriginal) {
         const date = new Date(exif.DateTimeOriginal);
         const yearStr = date.getFullYear().toString();
         const monthStr = (date.getMonth() + 1).toString().padStart(2, '0') + '月';
-        
         const yearFolderId = await getOrCreateFolder(yearStr, rootFolderId);
         return await getOrCreateFolder(monthStr, yearFolderId);
       }
@@ -306,55 +363,61 @@
     });
   }
 
-  $('backup').addEventListener('click', async () => {
-    if (uploading || !accessToken || !selectedFiles.length) return;
-    uploading = true; $('backup').disabled=true; $('progress').hidden=false; $('progress').value=0;
-    $('uploadState').textContent='準備中'; showResult('');
-    
-    let success=0; const skipped=[]; const failures=[];
-    try {
-      const rootFolderId = await getOrCreateFolder('iPhone 手動備份');
+  if ($('backup')) {
+    $('backup').addEventListener('click', async () => {
+      if (uploading || !accessToken || !selectedFiles.length) return;
+      uploading = true; $('backup').disabled=true; $('progress').hidden=false; $('progress').value=0;
+      $('uploadState').textContent='準備中'; showResult('');
       
-      for (let i=0; i<selectedFiles.length; i++) {
-        const file = selectedFiles[i];
-        $('uploadState').textContent=`處理中 ${i+1}/${selectedFiles.length}`;
+      let success=0; const skipped=[]; const failures=[];
+      try {
+        const rootFolderId = await getOrCreateFolder('iPhone 手動備份');
         
-        try {
-          $('progressText').textContent=`分析分類：${file.name}`;
-          const targetFolderId = await getTargetFolder(file, rootFolderId);
+        for (let i=0; i<selectedFiles.length; i++) {
+          const file = selectedFiles[i];
+          $('uploadState').textContent=`處理中 ${i+1}/${selectedFiles.length}`;
           
-          $('progressText').textContent=`檢查是否重複：${file.name}`;
-          const isDuplicate = await checkFileExists(file.name, targetFolderId);
-          
-          if (isDuplicate) {
-            skipped.push(file.name);
-            console.log(`跳過重複檔案: ${file.name}`);
-          } else {
-            $('progressText').textContent=`正在上傳：${file.name}`;
-            await uploadFileWithRetry(file, targetFolderId, fraction => {
-              $('progress').value=((i+fraction)/selectedFiles.length)*100;
-            });
-            success++;
+          try {
+            $('progressText').textContent=`分析分類：${file.name}`;
+            const targetFolderId = await getTargetFolder(file, rootFolderId);
+            
+            $('progressText').textContent=`檢查是否重複：${file.name}`;
+            const isDuplicate = await checkFileExists(file.name, targetFolderId);
+            
+            if (isDuplicate) {
+              skipped.push(file.name);
+              console.log(`跳過重複檔案: ${file.name}`);
+            } else {
+              $('progressText').textContent=`正在上傳：${file.name}`;
+              await uploadFileWithRetry(file, targetFolderId, fraction => {
+                $('progress').value=((i+fraction)/selectedFiles.length)*100;
+              });
+              success++;
+            }
+          } catch(err) { 
+            failures.push(`${file.name}：${err.message}`); 
           }
-        } catch(err) { 
-          failures.push(`${file.name}：${err.message}`); 
+          $('progress').value=((i+1)/selectedFiles.length)*100;
         }
-        $('progress').value=((i+1)/selectedFiles.length)*100;
+        
+        $('uploadState').textContent=failures.length ? '部分完成' : '完成';
+        let resultMsg = `備份完成！\n成功上傳：${success} 個`;
+        if (skipped.length > 0) resultMsg += `\n跳過重複：${skipped.length} 個`;
+        if (failures.length > 0) resultMsg += `\n失敗：${failures.length} 個\n` + failures.join('\n');
+        
+        showResult(resultMsg, failures.length ? 'error' : 'success');
+        $('progressText').textContent='上傳工作已結束。';
+        
+        // 儲存歷史紀錄
+        saveBackupHistory(success, skipped, failures);
+        
+      } catch(err) {
+        $('uploadState').textContent='失敗'; showResult('備份準備失敗：'+err.message,'error');
+      } finally {
+        uploading=false; refreshSelection();
       }
-      
-      $('uploadState').textContent=failures.length ? '部分完成' : '完成';
-      let resultMsg = `備份完成！\n成功上傳：${success} 個`;
-      if (skipped.length > 0) resultMsg += `\n跳過重複：${skipped.length} 個`;
-      if (failures.length > 0) resultMsg += `\n失敗：${failures.length} 個\n` + failures.join('\n');
-      
-      showResult(resultMsg, failures.length ? 'error' : 'success');
-      $('progressText').textContent='上傳工作已結束。';
-    } catch(err) {
-      $('uploadState').textContent='失敗'; showResult('備份準備失敗：'+err.message,'error');
-    } finally {
-      uploading=false; refreshSelection();
-    }
-  });
+    });
+  }
 
   // --- PWA 版本自動更新偵測 ---
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
@@ -376,6 +439,7 @@
   }
   
   refreshSelection();
+  loadBackupHistory();
 })();
 </script>
 </body>
