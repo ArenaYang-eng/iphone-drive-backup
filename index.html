@@ -40,9 +40,16 @@
 </head>
 <body>
 <main>
-  <header>
+    <header>
     <div class="logo" aria-hidden="true">☁</div>
-    <div><h1>我的備份中心</h1><div class="sub">iPhone → Google Drive｜手動選取版 A</div></div>
+    <div style="flex:1; display:flex; justify-content:space-between; align-items:flex-start;">
+      <div>
+        <h1>我的備份中心</h1>
+        <div class="sub">iPhone → Google Drive｜手動選取版 A</div>
+      </div>
+      <!-- 新增版本號標籤 -->
+      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v2.0</span>
+    </div>
   </header>
 
   <section class="card">
@@ -107,7 +114,12 @@
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (() => {
+  (() => {
+  const APP_VERSION = 'v2.0'; // 👈 在未來更新時，只需修改此處
+  const $ = (id) => document.getElementById(id);
   const $ = id => document.getElementById(id);
+  // 👇 2. 在這裡將版本號寫入剛剛添加的 HTML 標籤中
+    document.getElementById('versionDisplay').textContent = APP_VERSION;
   let tokenClient = null;
   let accessToken = null;
   let selectedFiles = [];
