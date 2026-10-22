@@ -198,16 +198,52 @@
     }
     return response.status === 204 ? null : response.json();
   }
-  async function ensureFolder() {
-    if (folderId) return folderId;
-    const query = encodeURIComponent("name = 'iPhone 手動備份' and mimeType = 'application/vnd.google-apps.folder' and trashed = false");
-    const found = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,mimeType)&pageSize=100`);
-    if (found.files && found.files.length) { folderId = found.files[0].id; return folderId; }
-    const folder = await apiRequest('https://www.googleapis.com/drive/v3/files?fields=id,name', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name:'iPhone 手動備份', mimeType:'application/vnd.google-apps.folder'})
+  // 1. 通用：取得或建立指定名稱的資料夾
+  async function getOrCreateFolder(folderName, parentId = null) {
+    let query = `name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+    if (parentId) query += ` and '${parentId}' in parents`;
+    
+    // 先搜尋是否已存在
+    const found = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=1`);
+    if (found.files && found.files.length > 0) return found.files[0].id;
+
+    // 不存在則建立
+    const metadata = { name: folderName, mimeType: 'application/vnd.google-apps.folder' };
+    if (parentId) metadata.parents = [parentId];
+    
+    const folder = await apiRequest('https://www.googleapis.com/drive/v3/files?fields=id', {
+      method: 'POST', 
+      headers: {'Content-Type': 'application/json'}, 
+      body: JSON.stringify(metadata)
     });
-    folderId = folder.id; return folderId;
+    return folder.id;
+  }
+
+  // 2. 解析 EXIF 並決定該檔案要去的目標資料夾
+   async function getTargetFolder(file, rootFolderId) {
+    // 如果檔案不是圖片（例如影片、文件），統一放到「其他檔案」
+    if (!file.type.startsWith('image/')) {
+      return await getOrCreateFolder('其他檔案', rootFolderId);
+    }
+
+    try {
+      // 使用 exifr 讀取拍攝時間
+      const exif = await exifr.parse(file, ['DateTimeOriginal']);
+      if (exif && exif.DateTimeOriginal) {
+        const date = new Date(exif.DateTimeOriginal);
+        const yearStr = date.getFullYear().toString();
+        const monthStr = (date.getMonth() + 1).toString().padStart(2, '0') + '月';
+        
+        // 建立「年份」資料夾，再建立「月份」資料夾
+        const yearFolderId = await getOrCreateFolder(yearStr, rootFolderId);
+        return await getOrCreateFolder(monthStr, yearFolderId);
+      }
+    } catch (e) {
+      console.warn('無法讀取 EXIF 時間:', e);
+    }
+    
+    // 如果沒有 EXIF 時間（例如截圖、下載的圖片），放到「未分類照片」
+    return await getOrCreateFolder('未分類照片', rootFolderId);
   }
   function uploadFile(file, parentId, onProgress) {
     return new Promise((resolve, reject) => {
@@ -235,15 +271,23 @@
     if (uploading || !accessToken || !selectedFiles.length) return;
     uploading = true; $('backup').disabled=true; $('progress').hidden=false; $('progress').value=0;
     $('uploadState').textContent='準備中'; showResult('');
-    let success=0; const failures=[];
+        let success=0; const failures=[];
     try {
-      const parentId = await ensureFolder();
+      // 1. 先確保根目錄「iPhone 手動備份」存在
+      const rootFolderId = await getOrCreateFolder('iPhone 手動備份');
+      
       for (let i=0; i<selectedFiles.length; i++) {
         const file = selectedFiles[i];
-        $('uploadState').textContent=`上傳 ${i+1}/${selectedFiles.length}`;
+        $('uploadState').textContent=`處理中 ${i+1}/${selectedFiles.length}`;
+        
+        // 2. 計算該檔案的目的地（依照時間分類）
+        $('progressText').textContent=`正在分析檔案時間：${file.name}`;
+        const targetFolderId = await getTargetFolder(file, rootFolderId);
+        
+        // 3. 開始上傳
         $('progressText').textContent=`正在上傳：${file.name}`;
         try {
-          await uploadFile(file, parentId, fraction => {
+          await uploadFile(file, targetFolderId, fraction => {
             $('progress').value=((i+fraction)/selectedFiles.length)*100;
           });
           success++;
