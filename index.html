@@ -308,6 +308,25 @@
     window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
   }
   refreshSelection();
+    // --- PWA 版本自動更新偵測 ---
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js').then(reg => {
+        reg.onupdatefound = () => {
+          const newWorker = reg.installing;
+          newWorker.onstatechange = () => {
+            if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+              // 跳出更新提示
+              if (confirm('發現新版本！是否立即重新整理以套用更新？')) {
+                newWorker.postMessage({ action: 'skipWaiting' });
+                window.location.reload();
+              }
+            }
+          };
+        };
+      }).catch(err => console.error('SW註冊失敗:', err));
+    });
+  }
 })();
 </script>
 </body>
