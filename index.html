@@ -57,7 +57,7 @@
         <h1>我的備份中心</h1>
         <div class="sub">iPhone → Google Drive｜手動選取版 A</div>
       </div>
-      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v3.4</span>
+      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v3.5</span>
     </div>
   </header>
 
@@ -88,13 +88,13 @@
       
       <label class="picker">
         <strong>📷 照片與影片</strong>
-        <span class="sub">可多選；系統會自動讀取拍攝時間，分類到「年份/月份」資料夾。</span>
+        <span class="sub">可多選；系統會讀取拍攝時間（照片讀 EXIF，影片或無 EXIF 者用檔案時間），分類到「年份/月份」資料夾。</span>
         <input id="mediaPicker" type="file" accept="image/*,video/*" multiple>
       </label>
       
       <div class="info-box">
         <p class="hint" style="margin:0 0 8px 0; font-weight:bold; color:var(--ink);">匯出 Google 帳號資料</p>
-        <p class="hint" style="margin:0 0 10px 0;">勾選後，系統會自動向 Google 取得資料，並打包成通用備份檔（.vcf 與 .ics），存入雲端「其他檔案」資料夾。</p>
+        <p class="hint" style="margin:0 0 10px 0;">勾選後，系統會自動向 Google 取得資料，並打包成通用備份檔（.vcf 與 .ics），存入雲端「其他檔案」資料夾，檔名會帶日期時間，每次都是新的一份。僅限 Google 帳號內的聯絡人與行事曆；iPhone 本機或 iCloud 通訊錄請先在「通訊錄」App 匯出 .vcf，再從下方「文件與其他檔案」選取。</p>
         
         <label style="display:flex; align-items:center; gap:8px; padding:10px; background:white; border:1px solid #dce3e9; border-radius:8px; margin-bottom:8px; cursor:pointer;">
           <input type="checkbox" id="includeContacts" style="width:20px; height:20px; margin:0;">
@@ -104,6 +104,14 @@
           <input type="checkbox" id="includeCalendar" style="width:20px; height:20px; margin:0;">
           <strong>📅 匯出 Google 行事曆 (.ics)</strong>
         </label>
+        <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
+          <label for="calendarRange" class="hint" style="margin:0; white-space:nowrap;">行事曆範圍</label>
+          <select id="calendarRange" style="flex:1; min-height:40px; border:1px solid #bcc9d4; border-radius:10px; padding:6px; font-size:14px; background:white;">
+            <option value="1">過去 1 年＋未來 2 年</option>
+            <option value="3">過去 3 年＋未來 2 年</option>
+            <option value="all">全部（2000 年起）＋未來 2 年</option>
+          </select>
+        </div>
       </div>
 
       <label class="picker">
@@ -121,7 +129,7 @@
 
     <section class="card">
       <div class="status"><h2>3. 執行備份</h2><span id="uploadState" class="pill">待命</span></div>
-      <p class="sub">上傳前會自動檢查雲端是否已有同名檔案，避免重複佔用空間。上傳失敗時系統會自動重試。</p>
+      <p class="sub">上傳前會檢查雲端是否已有「同名且大小相同」的檔案，避免重複佔用空間；同名但內容不同的會自動改名保留。上傳失敗時系統會自動重試。</p>
       <button id="backup" class="full" disabled>備份所選資料到 Google Drive</button>
       <progress id="progress" max="100" value="0" hidden></progress>
       <div id="progressText" class="hint" aria-live="polite"></div>
@@ -166,7 +174,7 @@
       <details open>
         <summary>👤 如何還原 Google 聯絡人 (.vcf)</summary>
         <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
-          1. 在「雲端還原」頁籤下載 <code>Google_Contacts.vcf</code>。<br>
+          1. 在「雲端還原」頁籤下載 <code>Google_Contacts_日期時間.vcf</code>。<br>
           2. 打開 iPhone 的「檔案」App，找到該檔案並點擊。<br>
           3. iOS 會跳出聯絡人預覽，點擊「新增所有聯絡人」即可匯入。
         </div>
@@ -175,7 +183,7 @@
       <details>
         <summary>📅 如何還原 Google 行事曆 (.ics)</summary>
         <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
-          1. 在「雲端還原」頁籤下載 <code>Google_Calendar.ics</code>。<br>
+          1. 在「雲端還原」頁籤下載 <code>Google_Calendar_日期時間.ics</code>。<br>
           2. 打開「檔案」App，點擊該檔案。<br>
           3. 在跳出的選單中點擊「行事曆」，選擇要加入的行事曆後確認即可。
         </div>
@@ -200,7 +208,7 @@
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (() => {
-  const APP_VERSION = 'v3.4';
+  const APP_VERSION = 'v3.5';
   const $ = id => document.getElementById(id);
   
   const verEl = $('versionDisplay');
@@ -307,32 +315,69 @@
     return folder.id;
   }
 
-  async function getTargetFolder(file, rootFolderId) {
-    if (!file.type.startsWith('image/')) return await getOrCreateFolder('其他檔案', rootFolderId);
-    try {
-      const exif = await exifr.parse(file, ['DateTimeOriginal']);
-      if (exif && exif.DateTimeOriginal) {
-        const date = new Date(exif.DateTimeOriginal);
-        const yearStr = date.getFullYear().toString();
-        const monthStr = (date.getMonth() + 1).toString().padStart(2, '0') + '月';
-        const yearFolderId = await getOrCreateFolder(yearStr, rootFolderId);
-        return await getOrCreateFolder(monthStr, yearFolderId);
+  const MEDIA_EXT = /\.(jpe?g|png|heic|heif|gif|webp|tiff?|bmp|dng|avif|mov|mp4|m4v|3gp|avi|mkv)$/i;
+  const EXIF_EXT = /\.(jpe?g|png|heic|heif|tiff?|dng|avif)$/i;
+  let exifrWarned = false;
+
+  function isMedia(file) { return /^(image|video)\//.test(file.type) || MEDIA_EXT.test(file.name); }
+  function isPlausibleDate(d) { return d instanceof Date && !isNaN(d) && d.getFullYear() >= 1990 && d.getTime() <= Date.now() + 86400000; }
+
+  // 取得拍攝日期：EXIF → 檔案修改時間 → null（未分類）
+  async function getCaptureDate(file) {
+    if (file.type.startsWith('image/') || EXIF_EXT.test(file.name)) {
+      if (window.exifr) {
+        try {
+          const exif = await exifr.parse(file, ['DateTimeOriginal', 'CreateDate']);
+          const raw = exif && (exif.DateTimeOriginal || exif.CreateDate);
+          const d = raw instanceof Date ? raw : (raw ? new Date(raw) : null);
+          if (isPlausibleDate(d)) return d;
+        } catch (e) { console.warn('無法讀取 EXIF 時間:', e); }
+      } else if (!exifrWarned) {
+        exifrWarned = true;
+        console.warn('exifr 尚未載入，照片將改用檔案修改時間分類。');
       }
-    } catch (e) { console.warn('無法讀取 EXIF 時間:', e); }
+    }
+    // 影片、或沒有 EXIF 的圖片：改用檔案修改時間。
+    // 若修改時間落在「選取當下」5 分鐘內，視為不可靠（可能是 iOS 選取時才產生），改放未分類。
+    if (file.lastModified) {
+      const d = new Date(file.lastModified);
+      if (isPlausibleDate(d) && Date.now() - d.getTime() > 5 * 60 * 1000) return d;
+    }
+    return null;
+  }
+
+  async function getTargetFolder(file, rootFolderId) {
+    if (!isMedia(file)) return await getOrCreateFolder('其他檔案', rootFolderId);
+    const date = await getCaptureDate(file);
+    if (date) {
+      const yearFolderId = await getOrCreateFolder(date.getFullYear().toString(), rootFolderId);
+      return await getOrCreateFolder((date.getMonth() + 1).toString().padStart(2, '0') + '月', yearFolderId);
+    }
     return await getOrCreateFolder('未分類照片', rootFolderId);
   }
 
-  async function checkFileExists(fileName, parentId) {
-    const safeName = fileName.replace(/'/g, "\\'");
-    const query = `name = '${safeName}' and '${parentId}' in parents and trashed = false`;
-    const res = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=1`);
-    return res.files && res.files.length > 0;
+  // 重複判斷：「檔名＋大小」都相同才算重複。
+  // 同名但大小不同 → 視為不同檔案，改用「檔名_大小.副檔名」上傳，避免被誤跳過。
+  function altName(name, size) {
+    const i = name.lastIndexOf('.');
+    return i > 0 ? `${name.slice(0, i)}_${size}${name.slice(i)}` : `${name}_${size}`;
   }
 
-  async function uploadFileWithRetry(file, parentId, onProgress, maxRetries = 3) {
+  async function checkDuplicate(file, parentId) {
+    const q = s => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const alt = altName(file.name, file.size);
+    const query = `'${parentId}' in parents and trashed = false and (name = '${q(file.name)}' or name = '${q(alt)}')`;
+    const res = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,size)&pageSize=100`);
+    const files = res.files || [];
+    if (files.some(f => Number(f.size) === file.size)) return { duplicate: true };
+    const nameTaken = files.some(f => f.name === file.name);
+    return { duplicate: false, uploadName: nameTaken ? alt : file.name };
+  }
+
+  async function uploadFileWithRetry(file, parentId, onProgress, uploadName, maxRetries = 3) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const result = await uploadFile(file, parentId, onProgress);
+        const result = await uploadFile(file, parentId, onProgress, uploadName);
         if (result.size && Number(result.size) !== file.size) throw new Error(`檔案大小不符 (本地: ${file.size}, 雲端: ${result.size})`);
         return result;
       } catch (err) {
@@ -344,10 +389,10 @@
     }
   }
 
-  function uploadFile(file, parentId, onProgress) {
+  function uploadFile(file, parentId, onProgress, uploadName) {
     return new Promise((resolve, reject) => {
       const boundary = '-------iphoneBackupBoundary' + Math.random().toString(16).slice(2);
-      const metadata = {name:file.name, mimeType:file.type || 'application/octet-stream', parents:[parentId], description:`iPhone 手動備份；原始檔案大小 ${file.size} bytes`};
+      const metadata = {name:uploadName || file.name, mimeType:file.type || 'application/octet-stream', parents:[parentId], description:`iPhone 手動備份；原始檔案大小 ${file.size} bytes`};
       const prefix = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n--${boundary}\r\nContent-Type: ${file.type || 'application/octet-stream'}\r\n\r\n`;
       const suffix = `\r\n--${boundary}--`;
       const body = new Blob([prefix, file, suffix]);
@@ -368,41 +413,116 @@
   }
 
   // --- vCard 與 iCal 生成 ---
+  const pad2 = n => String(n).padStart(2, '0');
+  const stampTag = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}`; };
+
+  // RFC 6350 / 5545 TEXT 跳脫：反斜線、換行、逗號、分號
+  function esc(v) { return String(v ?? '').replace(/\\/g, '\\\\').replace(/\r?\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;'); }
+
+  // 每行最多 75 octets（UTF-8），續行以空白開頭；不切斷多位元組字元
+  function foldLine(line) {
+    const enc = new TextEncoder(); const out = []; let cur = '', bytes = 0, limit = 75;
+    for (const ch of line) {
+      const b = enc.encode(ch).length;
+      if (bytes + b > limit) { out.push(cur); cur = ''; bytes = 0; limit = 74; }
+      cur += ch; bytes += b;
+    }
+    out.push(cur);
+    return out.join('\r\n ');
+  }
+  const toLines = lines => lines.filter(Boolean).map(foldLine).join('\r\n') + '\r\n';
+
+  // 讀取所有分頁
+  async function fetchAllPages(baseUrl, listKey) {
+    let items = [], pageToken = null;
+    do {
+      const url = baseUrl + (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '');
+      const res = await apiRequest(url);
+      items = items.concat(res[listKey] || []);
+      pageToken = res.nextPageToken || null;
+    } while (pageToken);
+    return items;
+  }
+
+  const PHONE_TYPE = { mobile: 'CELL', home: 'HOME', work: 'WORK', main: 'PREF', homeFax: 'HOME,FAX', workFax: 'WORK,FAX', pager: 'PAGER' };
+  const MAIL_TYPE = { home: 'HOME', work: 'WORK' };
+  const ADDR_TYPE = { home: 'HOME', work: 'WORK' };
+
   async function generateContactsVcf() {
     showResult('正在取得 Google 聯絡人...', 'success');
-    const res = await apiRequest('https://people.googleapis.com/v1/people/me/connections?pageSize=1000&personFields=names,phoneNumbers,emailAddresses');
-    let vcf = '';
-    if (res.connections) {
-      res.connections.forEach(person => {
-        vcf += 'BEGIN:VCARD\r\nVERSION:3.0\r\n';
-        const name = person.names && person.names[0] ? person.names[0].displayName : '未命名';
-        vcf += `FN:${name}\r\n`;
-        if (person.phoneNumbers) person.phoneNumbers.forEach(phone => { vcf += `TEL;TYPE=${phone.type || 'CELL'}:${phone.value}\r\n`; });
-        if (person.emailAddresses) person.emailAddresses.forEach(email => { vcf += `EMAIL;TYPE=${email.type || 'HOME'}:${email.value}\r\n`; });
-        vcf += 'END:VCARD\r\n';
-      });
-    }
-    return new File([vcf], 'Google_Contacts.vcf', { type: 'text/vcard' });
+    const fields = 'names,nicknames,phoneNumbers,emailAddresses,organizations,addresses,birthdays,biographies,urls';
+    const people = await fetchAllPages(`https://people.googleapis.com/v1/people/me/connections?pageSize=1000&personFields=${fields}`, 'connections');
+    const flat = v => String(v ?? '').replace(/\r?\n/g, ' ');
+    const out = [];
+    people.forEach(p => {
+      const n = (p.names || []).find(x => x.metadata && x.metadata.primary) || (p.names || [])[0] || {};
+      const org = (p.organizations || [])[0] || {};
+      const fn = n.displayName || org.name || (p.emailAddresses || [])[0]?.value || (p.phoneNumbers || [])[0]?.value || '未命名';
+      const L = ['BEGIN:VCARD', 'VERSION:3.0'];
+      L.push(`N:${esc(n.familyName)};${esc(n.givenName)};${esc(n.middleName)};${esc(n.honorificPrefix)};${esc(n.honorificSuffix)}`);
+      L.push(`FN:${esc(fn)}`);
+      const nick = (p.nicknames || [])[0]?.value; if (nick) L.push(`NICKNAME:${esc(nick)}`);
+      if (org.name || org.department) L.push(`ORG:${esc(org.name)}${org.department ? ';' + esc(org.department) : ''}`);
+      if (org.title) L.push(`TITLE:${esc(org.title)}`);
+      if (org.name && !n.familyName && !n.givenName) L.push('X-ABShowAs:COMPANY');
+      (p.phoneNumbers || []).forEach(ph => L.push(`TEL;TYPE=${PHONE_TYPE[ph.type] || 'VOICE'}:${flat(ph.value)}`));
+      (p.emailAddresses || []).forEach(em => L.push(`EMAIL;TYPE=${MAIL_TYPE[em.type] || 'INTERNET'}:${flat(em.value)}`));
+      (p.addresses || []).forEach(a => L.push(`ADR;TYPE=${ADDR_TYPE[a.type] || 'POSTAL'}:;;${esc(a.streetAddress)};${esc(a.city)};${esc(a.region)};${esc(a.postalCode)};${esc(a.country)}`));
+      const b = (p.birthdays || [])[0]?.date;
+      // 沒有年份時沿用 Apple 慣例 1604 作為占位年
+      if (b && b.month && b.day) L.push(`BDAY:${b.year ? String(b.year).padStart(4, '0') : '1604'}-${pad2(b.month)}-${pad2(b.day)}`);
+      (p.urls || []).forEach(u => L.push(`URL:${flat(u.value)}`));
+      const note = (p.biographies || [])[0]?.value; if (note) L.push(`NOTE:${esc(note)}`);
+      L.push('END:VCARD');
+      out.push(toLines(L));
+    });
+    const file = new File([out.join('')], `Google_Contacts_${stampTag()}.vcf`, { type: 'text/vcard' });
+    return { file, count: people.length };
   }
+
+  const icsUtc = d => new Date(d).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  const icsDate = s => s.replace(/-/g, '');
+  const icsTime = (name, t) => t.date ? `${name};VALUE=DATE:${icsDate(t.date)}` : `${name}:${icsUtc(t.dateTime)}`;
 
   async function generateCalendarIcs() {
     showResult('正在取得 Google 行事曆...', 'success');
-    const res = await apiRequest('https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults=100&orderBy=startTime&singleEvents=true&timeMin=' + new Date().toISOString());
-    let ics = 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//My Backup Center//TW\r\n';
-    if (res.items) {
-      res.items.forEach(event => {
-        ics += 'BEGIN:VEVENT\r\n';
-        ics += `SUMMARY:${event.summary || '未命名事件'}\r\n`;
-        const start = event.start.dateTime || event.start.date;
-        const end = event.end.dateTime || event.end.date;
-        ics += `DTSTART:${start.replace(/[-:]/g, '').split('.')[0]}Z\r\n`;
-        ics += `DTEND:${end.replace(/[-:]/g, '').split('.')[0]}Z\r\n`;
-        if (event.description) ics += `DESCRIPTION:${event.description.replace(/\n/g, '\\n')}\r\n`;
-        ics += 'END:VEVENT\r\n';
-      });
+    const rangeVal = $('calendarRange') ? $('calendarRange').value : '1';
+    const now = new Date();
+    const timeMin = rangeVal === 'all' ? new Date('2000-01-01T00:00:00Z') : new Date(now.getFullYear() - Number(rangeVal), now.getMonth(), now.getDate());
+    const timeMax = new Date(now.getFullYear() + 2, now.getMonth(), now.getDate());
+
+    // 自己擁有／可編輯的所有行事曆（不含訂閱的節日等唯讀行事曆）
+    const cals = await fetchAllPages('https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250', 'items');
+    const own = cals.filter(c => c.accessRole === 'owner' || c.accessRole === 'writer');
+    const targets = own.length ? own : [{ id: 'primary', summary: '主要行事曆' }];
+
+    const L = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//My Backup Center//TW//ZH', 'CALSCALE:GREGORIAN'];
+    const seen = new Set(); let count = 0;
+    for (const cal of targets) {
+      const calName = cal.summaryOverride || cal.summary || cal.id;
+      const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?maxResults=2500&singleEvents=true&orderBy=startTime&showDeleted=false&timeMin=${encodeURIComponent(timeMin.toISOString())}&timeMax=${encodeURIComponent(timeMax.toISOString())}`;
+      const events = await fetchAllPages(url, 'items');
+      for (const ev of events) {
+        if (ev.status === 'cancelled' || !ev.start || !(ev.start.date || ev.start.dateTime)) continue;
+        const key = `${ev.iCalUID || ev.id}|${ev.start.date || ev.start.dateTime}`;
+        if (seen.has(key)) continue; seen.add(key);
+        L.push('BEGIN:VEVENT');
+        L.push(`UID:${ev.id}@google-calendar-backup`);
+        L.push(`DTSTAMP:${icsUtc(ev.updated || now)}`);
+        L.push(icsTime('DTSTART', ev.start));
+        if (ev.end && (ev.end.date || ev.end.dateTime)) L.push(icsTime('DTEND', ev.end));
+        L.push(`SUMMARY:${esc(ev.summary || '未命名事件')}`);
+        if (ev.location) L.push(`LOCATION:${esc(ev.location)}`);
+        if (ev.description) L.push(`DESCRIPTION:${esc(ev.description)}`);
+        L.push(`STATUS:${ev.status === 'tentative' ? 'TENTATIVE' : 'CONFIRMED'}`);
+        L.push(`CATEGORIES:${esc(calName)}`);
+        L.push('END:VEVENT');
+        count++;
+      }
     }
-    ics += 'END:VCALENDAR\r\n';
-    return new File([ics], 'Google_Calendar.ics', { type: 'text/calendar' });
+    L.push('END:VCALENDAR');
+    const file = new File([toLines(L)], `Google_Calendar_${stampTag()}.ics`, { type: 'text/calendar' });
+    return { file, count, calendars: targets.length };
   }
 
   // --- 雲端檔案瀏覽與下載 ---
@@ -591,64 +711,72 @@
   if ($('backup')) {
     $('backup').addEventListener('click', async () => {
       if (uploading || !accessToken) return;
-      if (selectedFiles.length === 0 && !$('includeContacts').checked && !$('includeCalendar').checked) return;
-      
-      uploading = true; $('backup').disabled=true; $('progress').hidden=false; $('progress').value=0;
-      $('uploadState').textContent='準備中'; showResult('');
-      
-      let success=0; const skipped=[]; const failures=[];
-      
+      const wantContacts = $('includeContacts') && $('includeContacts').checked;
+      const wantCalendar = $('includeCalendar') && $('includeCalendar').checked;
+      if (selectedFiles.length === 0 && !wantContacts && !wantCalendar) return;
+
+      uploading = true; $('backup').disabled = true; $('progress').hidden = false; $('progress').value = 0;
+      $('uploadState').textContent = '準備中'; showResult('');
+
+      let success = 0; const skipped = [], renamed = [], failures = [], notes = [];
+      const generated = []; // 產生的 .vcf/.ics 另外存放，不混進使用者的選取清單
+
       try {
-        if ($('includeContacts') && $('includeContacts').checked) selectedFiles.push(await generateContactsVcf());
-        if ($('includeCalendar') && $('includeCalendar').checked) selectedFiles.push(await generateCalendarIcs());
+        if (wantContacts) { const r = await generateContactsVcf(); generated.push(r.file); notes.push(`聯絡人 ${r.count} 筆`); }
+        if (wantCalendar) { const r = await generateCalendarIcs(); generated.push(r.file); notes.push(`行事曆事件 ${r.count} 筆（${r.calendars} 個行事曆）`); }
       } catch (err) {
         showResult('產生 Google 資料失敗：' + err.message, 'error');
+        $('uploadState').textContent = '失敗';
         uploading = false; refreshSelection(); return;
       }
 
+      const jobs = [...selectedFiles, ...generated];
+
       try {
         const rootFolderId = await getOrCreateFolder('iPhone 手動備份');
-        
-        for (let i=0; i<selectedFiles.length; i++) {
-          const file = selectedFiles[i];
-          $('uploadState').textContent=`處理中 ${i+1}/${selectedFiles.length}`;
-          
+
+        for (let i = 0; i < jobs.length; i++) {
+          const file = jobs[i];
+          $('uploadState').textContent = `處理中 ${i+1}/${jobs.length}`;
+
           try {
-            $('progressText').textContent=`分析分類：${file.name}`;
+            $('progressText').textContent = `分析分類：${file.name}`;
             const targetFolderId = await getTargetFolder(file, rootFolderId);
-            $('progressText').textContent=`檢查是否重複：${file.name}`;
-            const isDuplicate = await checkFileExists(file.name, targetFolderId);
-            
-            if (isDuplicate) {
+            $('progressText').textContent = `檢查是否重複：${file.name}`;
+            const dup = await checkDuplicate(file, targetFolderId);
+
+            if (dup.duplicate) {
               skipped.push(file.name);
-              console.log(`跳過重複檔案: ${file.name}`);
+              console.log(`跳過重複檔案（檔名與大小相同）: ${file.name}`);
             } else {
-              $('progressText').textContent=`正在上傳：${file.name}`;
+              $('progressText').textContent = `正在上傳：${file.name}`;
               await uploadFileWithRetry(file, targetFolderId, fraction => {
-                $('progress').value=((i+fraction)/selectedFiles.length)*100;
-              });
+                $('progress').value = ((i + fraction) / jobs.length) * 100;
+              }, dup.uploadName);
+              if (dup.uploadName !== file.name) renamed.push(`${file.name} → ${dup.uploadName}`);
               success++;
             }
-          } catch(err) { failures.push(`${file.name}：${err.message}`); }
-          $('progress').value=((i+1)/selectedFiles.length)*100;
+          } catch (err) { failures.push(`${file.name}：${err.message}`); }
+          $('progress').value = ((i + 1) / jobs.length) * 100;
         }
-        
-        $('uploadState').textContent=failures.length ? '部分完成' : '完成';
+
+        $('uploadState').textContent = failures.length ? '部分完成' : '完成';
         let resultMsg = `備份完成！\n成功上傳：${success} 個`;
+        if (notes.length) resultMsg += `\n（${notes.join('、')}）`;
         if (skipped.length > 0) resultMsg += `\n跳過重複：${skipped.length} 個`;
+        if (renamed.length > 0) resultMsg += `\n同名但內容不同，已改名上傳：${renamed.length} 個\n` + renamed.join('\n');
         if (failures.length > 0) resultMsg += `\n失敗：${failures.length} 個\n` + failures.join('\n');
-        
+
         showResult(resultMsg, failures.length ? 'error' : 'success');
-        $('progressText').textContent='上傳工作已結束。';
+        $('progressText').textContent = '上傳工作已結束。';
         saveBackupHistory(success, skipped, failures);
-        
-      } catch(err) {
-        $('uploadState').textContent='失敗'; showResult('備份準備失敗：'+err.message,'error');
+
+      } catch (err) {
+        $('uploadState').textContent = '失敗'; showResult('備份準備失敗：' + err.message, 'error');
       } finally {
-        uploading=false; 
+        uploading = false;
         if ($('includeContacts')) $('includeContacts').checked = false;
         if ($('includeCalendar')) $('includeCalendar').checked = false;
-        selectedFiles = selectedFiles.filter(f => !f.name.endsWith('.vcf') && !f.name.endsWith('.ics'));
         refreshSelection();
       }
     });
