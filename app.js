@@ -1,5 +1,5 @@
 (() => {
-  const APP_VERSION = 'v3.7';
+  const APP_VERSION = 'v3.8';
   const $ = id => document.getElementById(id);
   
   const verEl = $('versionDisplay');
@@ -20,6 +20,13 @@
   let exifrMissingCount = 0;
   let swReg = null;
   let syncUpdateBar = () => {}; // 由 initServiceWorker() 接手
+  // 本機備份帳本（IndexedDB）狀態
+  let ledgerAcct = null;          // 目前 Google 帳號的 permissionId；null = 尚未取得，帳本暫停使用
+  let ledgerAcctPromise = null;
+  let ledgerEpoch = 0;            // 斷線／換帳號時 +1，避免舊的非同步結果寫進新狀態
+  let ledgerDbPromise = null;
+  let ledgerBusy = false;         // 帳本維護（驗證／清除）進行中：暫停備份按鈕
+  const ledgerKeys = new Set();   // 目前帳號的帳本鍵（記憶體副本，用來在選取清單標示「已備份」）
 
 
   const savedClientId = localStorage.getItem('iphoneDriveBackupClientId') || '';
@@ -54,10 +61,17 @@
     selectedFiles.forEach((file, index) => {
       const li = document.createElement('li'); li.className = 'file';
       const name = document.createElement('div'); name.textContent = `${index+1}. ${file.name}`;
+      if (inLedger(file)) { const b = document.createElement('span'); b.className = 'pill ok'; b.style.marginLeft = '6px'; b.textContent = '帳本：已備份'; name.append(b); }
       const meta = document.createElement('div'); meta.className = 'filemeta'; meta.textContent = `${humanSize(file.size)} · ${file.type || '未知格式'}`;
       li.append(name, meta); $('fileList').append(li);
     });
-    $('backup').disabled = !accessToken || (!selectedFiles.length && !$('includeContacts').checked && !$('includeCalendar').checked) || uploading;
+    const ledgerHits = selectedFiles.filter(inLedger).length;
+    if ($('ledgerHint')) {
+      $('ledgerHint').hidden = !ledgerHits;
+      $('ledgerHint').textContent = ledgerHits ? `${ledgerHits} 個檔案先前已備份過（依本機帳本）。備份時會先向 Google Drive 驗證檔案仍在，驗證通過就直接跳過。` : '';
+    }
+    if ($('pruneBackedUp')) $('pruneBackedUp').hidden = !(ledgerHits && accessToken && !uploading && !ledgerBusy);
+    $('backup').disabled = !accessToken || (!selectedFiles.length && !$('includeContacts').checked && !$('includeCalendar').checked) || uploading || ledgerBusy;
   }
 
   function addFiles(list) {
@@ -214,7 +228,7 @@
   const qEsc = v => String(v).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   const rootKey = () => 'iphoneBackupRootFolderId:' + $('clientId').value.trim();
 
-  function resetDriveCaches() { folderCache.clear(); rootFolderPromise = null; }
+  function resetDriveCaches() { folderCache.clear(); rootFolderPromise = null; ledgerEpoch++; ledgerAcct = null; ledgerAcctPromise = null; ledgerKeys.clear(); }
 
   function getOrCreateFolder(folderName, parentId = null) {
     const key = `${parentId || 'root'}/${folderName}`;
@@ -309,7 +323,8 @@
     const query = `'${parentId}' in parents and trashed = false and (name = '${q(file.name)}' or name = '${q(alt)}')`;
     const res = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,size)&pageSize=100`);
     const files = res.files || [];
-    if (files.some(f => Number(f.size) === file.size)) return { duplicate: true };
+    const match = files.find(f => Number(f.size) === file.size);
+    if (match) return { duplicate: true, existingId: match.id, existingName: match.name };
     const nameTaken = files.some(f => f.name === file.name);
     return { duplicate: false, uploadName: nameTaken ? alt : file.name };
   }
@@ -660,6 +675,7 @@
         refreshSelection();
         showResult('Google Drive 已連線。現在可以選取檔案並備份。','success');
         loadCloudFiles();
+        initLedger();
       } catch (err) { showResult('Google 授權失敗：' + err.message, 'error'); }
     });
   }
@@ -671,7 +687,7 @@
       accessToken = null; tokenExpiresAt = 0; connectedOnce = false; grantedScopes = new Set(); resetDriveCaches();
       if ($('reauthBox')) $('reauthBox').hidden = true;
       $('connection').textContent = '尚未連線'; $('connection').className = 'pill warn';
-      $('disconnect').disabled = true; $('uploadState').textContent = '待命'; refreshSelection();
+      $('disconnect').disabled = true; $('uploadState').textContent = '待命'; refreshSelection(); renderLedgerStats();
       showResult('已清除本頁的連線狀態。');
     });
   }
@@ -750,6 +766,286 @@
     return { proceed: ok };
   }
 
+  // ===== 本機備份帳本（IndexedDB） =====
+  // 記住「哪個本機檔案已備份成 Drive 上的哪個檔案」，之後重複選取同一批照片時，
+  // 不必逐檔做 EXIF 分類、查資料夾、查重複、上傳。
+  // 帳本只是加速用的快取，Drive 才是事實：命中帳本的檔案，跳過前一定會向 Drive 驗證
+  // 「檔案還在、沒進垃圾桶、大小相符」，驗證不過就照常重新備份。所以帳本遺失或過時只會變慢，不會漏備份。
+  // 帳本以 Google 帳號（permissionId）分開，換帳號不會互相影響。
+  const LEDGER_DB = 'iphoneBackupLedger';
+  const LEDGER_STORE = 'files';
+  const LEDGER_VERIFY_GET_LIMIT = 25; // 命中數 ≤ 此值：逐檔 files.get；超過：一次列出整個備份清單比對
+  const fingerprint = f => `${f.name}|${f.size}|${f.lastModified}`;
+  const ledgerId = (acct, f) => `${acct}|${fingerprint(f)}`;
+  const inLedger = f => !!ledgerAcct && ledgerKeys.has(ledgerId(ledgerAcct, f));
+  const generatedFiles = new WeakSet(); // 程式產生的 .vcf/.ics（檔名帶時間戳，每次都是新檔），不進帳本
+
+  const idbReq = r => new Promise((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+  const txDone = tx => new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('帳本交易中止'));
+  });
+
+  function openLedgerDb() {
+    if (!ledgerDbPromise) {
+      ledgerDbPromise = new Promise((resolve, reject) => {
+        if (!window.indexedDB) return reject(new Error('此瀏覽器不支援 IndexedDB'));
+        const req = indexedDB.open(LEDGER_DB, 1);
+        req.onupgradeneeded = () => {
+          const st = req.result.createObjectStore(LEDGER_STORE, { keyPath: 'id' });
+          st.createIndex('acct', 'acct');
+        };
+        req.onsuccess = () => { const db = req.result; db.onversionchange = () => db.close(); resolve(db); };
+        req.onerror = () => reject(req.error || new Error('無法開啟帳本資料庫'));
+        req.onblocked = () => reject(new Error('帳本資料庫被其他分頁占用'));
+      });
+      ledgerDbPromise.catch(() => { ledgerDbPromise = null; });
+    }
+    return ledgerDbPromise;
+  }
+
+  async function ledgerStore(mode = 'readonly') {
+    const db = await openLedgerDb();
+    const tx = db.transaction(LEDGER_STORE, mode);
+    return { tx, store: tx.objectStore(LEDGER_STORE) };
+  }
+  async function ledgerRecords(acct) {
+    const { store } = await ledgerStore();
+    return idbReq(store.index('acct').getAll(IDBKeyRange.only(acct)));
+  }
+  async function ledgerGetMany(ids) {
+    if (!ids.length) return [];
+    const { store } = await ledgerStore();
+    return Promise.all(ids.map(id => idbReq(store.get(id))));
+  }
+  async function ledgerDeleteMany(ids) {
+    if (!ids.length) return;
+    const { tx, store } = await ledgerStore('readwrite');
+    ids.forEach(id => store.delete(id));
+    await txDone(tx);
+    ids.forEach(id => ledgerKeys.delete(id));
+  }
+
+  // 以 Drive 的 permissionId 當帳號識別碼（不含 email）。取不到就回傳 null：本次不使用帳本，備份照常進行。
+  async function getLedgerAccount() {
+    if (ledgerAcct) return ledgerAcct;
+    if (!ledgerAcctPromise) {
+      const epoch = ledgerEpoch;
+      ledgerAcctPromise = (async () => {
+        try {
+          const r = await apiRequest('https://www.googleapis.com/drive/v3/about?fields=user(permissionId)');
+          const id = r && r.user && r.user.permissionId;
+          if (!id) throw new Error('Drive 沒有回傳帳號識別碼');
+          if (epoch === ledgerEpoch) ledgerAcct = id; // 期間若已斷線／換帳號，不採用這個結果
+          return id;
+        } catch (e) {
+          console.warn('無法取得 Google 帳號識別碼，本次不使用帳本:', e.message);
+          if (epoch === ledgerEpoch) ledgerAcctPromise = null; // 失敗不快取，下次再試
+          return null;
+        }
+      })();
+    }
+    return ledgerAcctPromise;
+  }
+
+  async function refreshLedgerKeys() {
+    ledgerKeys.clear();
+    try {
+      const acct = await getLedgerAccount();
+      if (!acct) return;
+      const { store } = await ledgerStore();
+      const ids = await idbReq(store.index('acct').getAllKeys(IDBKeyRange.only(acct)));
+      if (acct !== ledgerAcct) return;
+      ids.forEach(k => ledgerKeys.add(k));
+    } catch (e) { console.warn('讀取帳本失敗:', e); }
+  }
+
+  // 成功上傳、或發現 Drive 已有「同名同大小」檔案時記一筆。寫入失敗不影響備份。
+  async function ledgerRecord(file, driveId, folderId, uploadName) {
+    if (!driveId || generatedFiles.has(file)) return;
+    try {
+      const acct = await getLedgerAccount();
+      if (!acct) return;
+      const now = Date.now();
+      const rec = {
+        id: ledgerId(acct, file), acct, name: file.name, size: file.size, lastModified: file.lastModified,
+        driveId, folderId: folderId || null, uploadName: uploadName || file.name, uploadedAt: now, verifiedAt: now
+      };
+      const { tx, store } = await ledgerStore('readwrite');
+      store.put(rec);
+      await txDone(tx);
+      ledgerKeys.add(rec.id);
+    } catch (e) { console.warn('寫入帳本失敗（不影響備份）:', e); }
+  }
+
+  // 向 Drive 確認這些帳本紀錄對應的檔案是否還在。
+  // 回傳 { confirmed, stale }（都是 Drive 檔案 ID 的 Set）：
+  //   confirmed = 仍存在、不在垃圾桶、大小相符；stale = 確定已不存在／在垃圾桶／大小不符。
+  //   兩者都不含的（例如網路錯誤）代表「無法確認」：不跳過、也不刪帳本，交給一般流程處理。
+  async function verifyDriveFiles(records, opts = {}) {
+    const check = opts.cancellable === false ? () => {} : throwIfCancelled;
+    const confirmed = new Set(), stale = new Set();
+    if (!records.length) return { confirmed, stale };
+
+    if (!opts.forceList && records.length <= LEDGER_VERIFY_GET_LIMIT) {
+      for (const r of records) {
+        check();
+        try {
+          const f = await apiRequest(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(r.driveId)}?fields=id,size,trashed`);
+          if (f && !f.trashed && Number(f.size) === r.size) confirmed.add(r.driveId); else stale.add(r.driveId);
+        } catch (e) {
+          if (e.cancelled || e.aborted) throw e;
+          if (e.status === 404) stale.add(r.driveId);
+          else console.warn('驗證帳本項目失敗，視為無法確認:', e.message);
+        }
+      }
+      return { confirmed, stale };
+    }
+
+    // 筆數多：一次列出本 App 建立的所有未刪除檔案（每頁 1000 筆），比逐檔查詢省很多請求
+    const sizes = new Map(records.map(r => [r.driveId, r.size]));
+    const q = "trashed = false and mimeType != 'application/vnd.google-apps.folder'";
+    let pageToken = null;
+    do {
+      check();
+      const res = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=nextPageToken,files(id,size)&pageSize=1000${pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''}`);
+      for (const f of res.files || []) if (sizes.has(f.id) && Number(f.size) === sizes.get(f.id)) confirmed.add(f.id);
+      pageToken = res.nextPageToken || null;
+    } while (pageToken);
+    // 整份清單都讀完了才會走到這裡：沒出現在清單裡的，就是確定不在了
+    sizes.forEach((_, id) => { if (!confirmed.has(id)) stale.add(id); });
+    return { confirmed, stale };
+  }
+
+  // 備份前先比對帳本：已備份且 Drive 驗證仍在的檔案直接跳過（不分類、不查重複、不上傳）。
+  async function planWithLedger(jobs) {
+    const plan = { toProcess: jobs, ledgerSkipped: [], stale: 0 };
+    const acct = await getLedgerAccount();
+    if (!acct) return plan;
+
+    const hits = [];
+    try {
+      const candidates = jobs.filter(f => !generatedFiles.has(f));
+      const recs = await ledgerGetMany(candidates.map(f => ledgerId(acct, f)));
+      candidates.forEach((f, i) => { if (recs[i]) hits.push({ file: f, rec: recs[i] }); });
+    } catch (e) { console.warn('讀取帳本失敗，改走一般流程:', e); return plan; }
+    if (!hits.length) return plan;
+
+    $('progressText').textContent = `本機帳本：${hits.length} 個檔案先前已備份，正在向 Google Drive 驗證…`;
+    let v;
+    try { v = await verifyDriveFiles(hits.map(h => h.rec)); }
+    catch (e) {
+      if (e.cancelled || e.aborted) throw e;
+      console.warn('帳本驗證失敗，改走一般流程:', e.message);
+      return plan;
+    }
+
+    const skip = new Set(), staleIds = [];
+    hits.forEach(({ file, rec }) => {
+      if (v.confirmed.has(rec.driveId)) skip.add(file);
+      else if (v.stale.has(rec.driveId)) staleIds.push(rec.id);
+    });
+    try { await ledgerDeleteMany(staleIds); } catch (e) { console.warn('清理過時帳本項目失敗:', e); }
+    plan.ledgerSkipped = jobs.filter(f => skip.has(f));
+    plan.toProcess = jobs.filter(f => !skip.has(f));
+    plan.stale = staleIds.length;
+    return plan;
+  }
+
+  // ----- 設定頁：帳本資訊、同步驗證、清除；備份頁：移除已備份的檔案 -----
+  function setLedgerMsg(msg, ok) {
+    const m = $('ledgerMsg'); if (!m) return;
+    m.className = 'hint ' + (ok === true ? 'success' : ok === false ? 'error' : '');
+    m.textContent = msg;
+  }
+
+  async function renderLedgerStats() {
+    const box = $('ledgerStats'); if (!box) return;
+    if ($('ledgerSync')) $('ledgerSync').disabled = true;
+    try {
+      let persisted = null;
+      try { if (navigator.storage && navigator.storage.persisted) persisted = await navigator.storage.persisted(); } catch (e) { /* 不支援就略過 */ }
+      const persistText = persisted === true ? '已啟用' : persisted === false ? '未啟用（儲存空間吃緊時，系統可能清除帳本；清除只會讓備份變慢）' : '未知';
+      if (!accessToken) {
+        const { store } = await ledgerStore();
+        const n = await idbReq(store.count());
+        box.textContent = `帳本筆數（所有帳號合計）：${n}。連線 Google 後可看到目前帳號的明細。瀏覽器儲存保護：${persistText}`;
+        return;
+      }
+      const acct = await getLedgerAccount();
+      if (!acct) { box.textContent = '目前無法取得 Google 帳號識別碼，帳本暫停使用（備份仍會照常進行）。'; return; }
+      const recs = await ledgerRecords(acct);
+      let bytes = 0, last = 0;
+      recs.forEach(r => { bytes += r.size || 0; if (r.uploadedAt > last) last = r.uploadedAt; });
+      box.textContent = `目前帳號帳本筆數：${recs.length}｜合計容量：${humanSize(bytes)}｜最近記錄：${last ? new Date(last).toLocaleString() : '—'}｜瀏覽器儲存保護：${persistText}`;
+      if ($('ledgerSync')) $('ledgerSync').disabled = false;
+    } catch (e) { box.textContent = '無法讀取帳本：' + e.message; }
+  }
+
+  async function initLedger() {
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* 盡力而為 */ }
+    await refreshLedgerKeys();
+    refreshSelection();
+    renderLedgerStats();
+  }
+
+  async function pruneBackedUp() {
+    if (uploading || ledgerBusy || !accessToken) return;
+    ledgerBusy = true; refreshSelection();
+    showResult('正在向 Google Drive 驗證已備份的檔案…');
+    try {
+      const acct = await getLedgerAccount();
+      if (!acct) throw new Error('目前無法取得 Google 帳號識別碼');
+      const files = selectedFiles.filter(inLedger);
+      const recs = await ledgerGetMany(files.map(f => ledgerId(acct, f)));
+      const pairs = files.map((f, i) => ({ f, rec: recs[i] })).filter(p => p.rec);
+      const v = await verifyDriveFiles(pairs.map(p => p.rec), { cancellable: false });
+      const drop = new Set(pairs.filter(p => v.confirmed.has(p.rec.driveId)).map(p => p.f));
+      const staleIds = pairs.filter(p => v.stale.has(p.rec.driveId)).map(p => p.rec.id);
+      await ledgerDeleteMany(staleIds);
+      selectedFiles = selectedFiles.filter(f => !drop.has(f));
+      showResult(`已從清單移除 ${drop.size} 個已備份、且驗證仍在 Drive 的檔案。` +
+        (staleIds.length ? `\n另有 ${staleIds.length} 個在 Drive 已不存在，已從帳本移除；它們仍在清單中，會重新備份。` : ''), 'success');
+    } catch (e) { showResult('驗證失敗，清單未更動：' + e.message, 'error'); }
+    finally { ledgerBusy = false; renderLedgerStats(); refreshSelection(); }
+  }
+
+  async function syncLedger() {
+    if (uploading || ledgerBusy || !accessToken) return;
+    ledgerBusy = true; refreshSelection();
+    setLedgerMsg('正在列出 Drive 上的備份檔並比對…');
+    try {
+      const acct = await getLedgerAccount();
+      if (!acct) throw new Error('目前無法取得 Google 帳號識別碼');
+      const recs = await ledgerRecords(acct);
+      if (!recs.length) { setLedgerMsg('帳本是空的，沒有需要驗證的項目。', true); return; }
+      const v = await verifyDriveFiles(recs, { forceList: true, cancellable: false });
+      const staleIds = recs.filter(r => v.stale.has(r.driveId)).map(r => r.id);
+      await ledgerDeleteMany(staleIds);
+      setLedgerMsg(`同步完成：保留 ${recs.length - staleIds.length} 筆，移除 ${staleIds.length} 筆（Drive 上已不存在、在垃圾桶或大小不符）。`, true);
+    } catch (e) { setLedgerMsg('同步失敗，帳本未更動：' + e.message, false); }
+    finally { ledgerBusy = false; await renderLedgerStats(); refreshSelection(); }
+  }
+
+  async function clearLedger() {
+    if (uploading || ledgerBusy) return;
+    if (!confirm('要清除本機備份帳本嗎？\n\n不會刪除 Drive 上的任何檔案。清除後，下次備份會改成逐檔向 Drive 檢查重複，速度較慢，但結果仍然正確。')) return;
+    ledgerBusy = true; refreshSelection();
+    try {
+      const { tx, store } = await ledgerStore('readwrite');
+      store.clear();
+      await txDone(tx);
+      ledgerKeys.clear();
+      setLedgerMsg('已清除本機帳本。', true);
+    } catch (e) { setLedgerMsg('清除失敗：' + e.message, false); }
+    finally { ledgerBusy = false; await renderLedgerStats(); refreshSelection(); }
+  }
+
+  if ($('ledgerSync')) $('ledgerSync').addEventListener('click', syncLedger);
+  if ($('ledgerClear')) $('ledgerClear').addEventListener('click', clearLedger);
+  if ($('pruneBackedUp')) $('pruneBackedUp').addEventListener('click', pruneBackedUp);
+
   // ===== 備份流程：忙碌狀態、取消、執行、只重試失敗 =====
   function setBusy(busy) {
     uploading = busy;
@@ -778,23 +1074,39 @@
     if (!$('reauthBox').hidden) $('reauthCancel').click();    // 正在等重新授權：一併結束等待
   }
 
-  async function runJobs(jobs, notes = []) {
-    failedJobs = jobs.slice(); // 先假設全部都要重試；途中若丟出例外，下次仍可重試
+  async function runJobs(allJobs, notes = []) {
+    failedJobs = allJobs.slice(); // 先假設全部都要重試；途中若丟出例外，下次仍可重試
     exifrMissingCount = 0;
     let success = 0;
     const skipped = [], renamed = [], failures = [], failedFiles = [];
     let stopIndex = -1, stopReason = null; // stopIndex 起算的檔案都視為「未處理」
 
+    // 先比對本機帳本：已備份且 Drive 驗證仍在的檔案直接跳過，不做分類／查重複／上傳
+    $('uploadState').textContent = '比對本機帳本';
+    let plan;
+    try { plan = await planWithLedger(allJobs); }
+    catch (err) {
+      if (err.cancelled || (err.aborted && cancelRequested)) {
+        $('uploadState').textContent = '已取消'; $('progressText').textContent = '';
+        showResult('備份已取消，尚未上傳任何檔案。可按「只重試失敗／未完成的檔案」。');
+        return;
+      }
+      throw err;
+    }
+    const jobs = plan.toProcess;
+    failedJobs = jobs.slice();
+    if (jobs.length === 0) $('progress').value = 100;
+
     $('uploadState').textContent = '檢查雲端空間';
     $('progressText').textContent = '正在檢查 Google 雲端剩餘空間…';
-    const space = await confirmEnoughSpace(jobs);
+    const space = jobs.length ? await confirmEnoughSpace(jobs) : { proceed: true };
     if (!space.proceed) {
       $('uploadState').textContent = '已取消'; $('progressText').textContent = '';
       showResult('已取消：雲端空間可能不足。清出空間後，可按「只重試失敗／未完成的檔案」。', 'error');
       return;
     }
 
-    const rootFolderId = await getRootFolderId();
+    const rootFolderId = jobs.length ? await getRootFolderId() : null;
 
     for (let i = 0; i < jobs.length; i++) {
       if (cancelRequested) { stopIndex = i; stopReason = 'cancel'; break; }
@@ -812,13 +1124,15 @@
         if (dup.duplicate) {
           skipped.push(file.name);
           console.log(`跳過重複檔案（檔名與大小相同）: ${file.name}`);
+          await ledgerRecord(file, dup.existingId, targetFolderId, dup.existingName); // 認領 Drive 上既有的備份，下次可直接由帳本跳過
         } else {
           $('progressText').textContent = `正在上傳：${file.name}`;
-          await uploadFileWithRetry(file, targetFolderId, fraction => {
+          const up = await uploadFileWithRetry(file, targetFolderId, fraction => {
             $('progress').value = ((i + fraction) / jobs.length) * 100;
           }, dup.uploadName);
           if (dup.uploadName !== file.name) renamed.push(`${file.name} → ${dup.uploadName}`);
           success++;
+          await ledgerRecord(file, up && up.id, targetFolderId, up && up.name);
         }
       } catch (err) {
         // 使用者取消：這個檔案算「未處理」（可能傳到一半），重試時會再檢查重複
@@ -838,7 +1152,9 @@
     let msg = stopReason === 'cancel' ? '備份已取消。' : (stopReason ? '備份已中止。' : '備份完成！');
     msg += `\n成功上傳：${success} 個`;
     if (notes.length) msg += `\n（${notes.join('、')}）`;
+    if (plan.ledgerSkipped.length > 0) msg += `\n帳本跳過：${plan.ledgerSkipped.length} 個（先前已備份，且已向 Drive 驗證仍在）`;
     if (skipped.length > 0) msg += `\n跳過重複：${skipped.length} 個`;
+    if (plan.stale > 0) msg += `\n帳本中有 ${plan.stale} 個項目在 Drive 已不存在或已變更，已重新備份並更新帳本。`;
     if (renamed.length > 0) msg += `\n同名但內容不同，已改名上傳：${renamed.length} 個\n` + renamed.join('\n');
     if (failures.length > 0) msg += `\n失敗：${failures.length} 個\n` + failures.join('\n');
     if (stopReason === 'cancel') msg += `\n尚未處理：${unprocessed.length} 個（已取消）`;
@@ -850,11 +1166,11 @@
 
     showResult(msg, (failures.length || stopReason === 'reauth' || stopReason === 'quota') ? 'error' : (stopReason === 'cancel' ? '' : 'success'));
     $('progressText').textContent = '上傳工作已結束。';
-    saveBackupHistory(success, skipped, failures);
+    saveBackupHistory(success, skipped.concat(plan.ledgerSkipped), failures);
   }
 
   async function startBackup() {
-    if (uploading || !accessToken) return;
+    if (uploading || ledgerBusy || !accessToken) return;
     const wantContacts = $('includeContacts').checked;
     const wantCalendar = $('includeCalendar').checked;
     if (selectedFiles.length === 0 && !wantContacts && !wantCalendar) return;
@@ -889,6 +1205,7 @@
     }
 
     try {
+      generated.forEach(f => generatedFiles.add(f));
       await runJobs([...selectedFiles, ...generated], notes);
     } catch (err) {
       $('uploadState').textContent = '失敗'; showResult('備份準備失敗：' + err.message, 'error');
@@ -985,4 +1302,5 @@
   if (!window.exifr && $('exifrWarn')) $('exifrWarn').hidden = false;
   refreshSelection();
   loadBackupHistory();
+  renderLedgerStats();
 })();
