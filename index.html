@@ -57,7 +57,7 @@
         <h1>我的備份中心</h1>
         <div class="sub">iPhone → Google Drive｜手動選取版 A</div>
       </div>
-      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v3.5</span>
+      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v3.6</span>
     </div>
   </header>
 
@@ -72,7 +72,7 @@
   <div id="tab-backup" class="tab-content active">
     <section class="card">
       <div class="status"><h2>1. Google Drive 連線</h2><span id="connection" class="pill warn">尚未連線</span></div>
-      <p class="hint" style="margin-bottom:8px;">首次設定需要建立 Google OAuth 用戶端 ID。登入後，本頁只取得暫時存取權杖；不會把權杖儲存在本機。</p>
+      <p class="hint" style="margin-bottom:8px;">首次設定需要建立 Google OAuth 用戶端 ID。登入後，本頁只取得暫時存取權杖；不會把權杖儲存在本機。連線時只要求 Drive 權限，匯出聯絡人或行事曆時才會在你勾選當下另外請求唯讀授權。</p>
       <label for="clientId" class="sub">Google OAuth 2.0 用戶端 ID</label>
       <input id="clientId" type="text" placeholder="例如：123456789-xxxx.apps.googleusercontent.com" autocomplete="off" autocapitalize="none" spellcheck="false">
       <div class="row" style="margin-top:10px">
@@ -131,6 +131,13 @@
       <div class="status"><h2>3. 執行備份</h2><span id="uploadState" class="pill">待命</span></div>
       <p class="sub">上傳前會檢查雲端是否已有「同名且大小相同」的檔案，避免重複佔用空間；同名但內容不同的會自動改名保留。上傳失敗時系統會自動重試。</p>
       <button id="backup" class="full" disabled>備份所選資料到 Google Drive</button>
+      <div id="reauthBox" hidden style="margin-top:10px; padding:12px; border:1px solid #f0c36d; background:#fff8e6; border-radius:10px;">
+        <p id="reauthMsg" class="hint" style="margin:0 0 8px 0; color:var(--ink);">Google 授權已過期，請重新授權後繼續。</p>
+        <div class="row">
+          <button id="reauthBtn">重新授權並繼續</button>
+          <button id="reauthCancel" class="secondary">放棄本次備份</button>
+        </div>
+      </div>
       <progress id="progress" max="100" value="0" hidden></progress>
       <div id="progressText" class="hint" aria-live="polite"></div>
       <div id="result" style="margin-top:10px" aria-live="polite"></div>
@@ -193,8 +200,11 @@
     <section class="card">
       <h2>🛡️ 安全與隱私說明</h2>
       <ul style="padding-left:18px; list-style:disc; margin-top:10px; line-height:1.6; font-size:13px; color:var(--muted);">
-        <li>本工具為純前端網頁，使用 Google 的 <code>drive.file</code> 權限，僅能存取「由本工具建立」的檔案，無法偷看您雲端硬碟的其他資料。</li>
-        <li>您的 Google 授權金鑰（Access Token）只暫存在瀏覽器記憶體中，重新整理網頁即失效，不會被惡意竊取。</li>
+        <li>連線時只要求 Google 的 <code>drive.file</code> 權限，僅能存取「由本工具建立」的檔案，無法讀取您雲端硬碟的其他資料。</li>
+        <li>聯絡人與行事曆是「唯讀」權限，只在您勾選匯出的當下才會請求；資料只用來在您的手機上產生備份檔，並上傳到您自己的 Drive，不會傳到其他地方。</li>
+        <li>授權金鑰（Access Token）只暫存在瀏覽器記憶體中，約 1 小時後失效，重新整理網頁也會清除。但本頁仍需載入 Google 登入元件與 EXIF 解析套件等第三方腳本，請只在您信任的網址使用。</li>
+        <li>長時間備份時授權可能過期：本頁會先嘗試自動續期，失敗時會暫停並顯示「重新授權並繼續」，授權後從原本的檔案接著做。</li>
+        <li>此裝置的瀏覽器會儲存：用戶端 ID、備份根資料夾 ID，以及最近 5 筆備份的數量統計（沒有檔名）；不會儲存授權金鑰。</li>
         <li>請勿在公用電腦上儲存您的 Client ID，或在公共場所進行大量備份。</li>
         <li>iOS 系統在螢幕鎖定或切換 App 時可能會暫停網頁運作，備份期間請保持螢幕亮起。</li>
       </ul>
@@ -208,7 +218,7 @@
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (() => {
-  const APP_VERSION = 'v3.5';
+  const APP_VERSION = 'v3.6';
   const $ = id => document.getElementById(id);
   
   const verEl = $('versionDisplay');
@@ -289,30 +299,172 @@
     loadBackupHistory();
   }
 
+  // --- Google 授權（Token 管理 / 漸進授權） ---
+  const SCOPE_DRIVE = 'https://www.googleapis.com/auth/drive.file';
+  const SCOPE_CONTACTS = 'https://www.googleapis.com/auth/contacts.readonly';
+  const SCOPE_CALENDAR = 'https://www.googleapis.com/auth/calendar.readonly';
+  let tokenClientId = null;
+  let tokenExpiresAt = 0;
+  let grantedScopes = new Set();
+  let pendingAuth = null;
+  let reauthWaiter = null;
+  let connectedOnce = false;
+
+  const hasScope = sc => grantedScopes.has(sc);
+  const tokenFresh = (marginMs = 60000) => !!accessToken && Date.now() < tokenExpiresAt - marginMs;
+  const timeout = ms => new Promise((_, rej) => setTimeout(() => rej(new Error('等待逾時')), ms));
+
+  function initTokenClient() {
+    const id = $('clientId').value.trim();
+    if (tokenClient && tokenClientId === id) return tokenClient;
+    tokenClientId = id;
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: id,
+      scope: SCOPE_DRIVE, // 連線時只要求 Drive；聯絡人／行事曆在勾選匯出時才額外請求
+      callback: response => {
+        const p = pendingAuth; pendingAuth = null;
+        if (response.error) { if (p) p.reject(new Error(response.error)); return; }
+        applyToken(response);
+        if (p) p.resolve(response);
+      },
+      error_callback: err => {
+        const p = pendingAuth; pendingAuth = null;
+        if (p) p.reject(new Error(err.message || err.type || '授權視窗發生問題'));
+      }
+    });
+    return tokenClient;
+  }
+
+  function applyToken(r) {
+    accessToken = r.access_token;
+    tokenExpiresAt = Date.now() + (Number(r.expires_in) || 3600) * 1000;
+    if (r.scope) grantedScopes = new Set(r.scope.split(' ').filter(Boolean));
+    connectedOnce = true;
+    $('connection').textContent = '已連線'; $('connection').className = 'pill ok';
+  }
+
+  // overrides 可帶 { prompt, scope, include_granted_scopes }；需在使用者點擊（手勢）中呼叫，iOS 才不會擋彈窗
+  function requestToken(overrides = {}) {
+    return new Promise((resolve, reject) => {
+      if (!window.google || !google.accounts || !google.accounts.oauth2) return reject(new Error('Google 登入元件尚未載入'));
+      if (pendingAuth) pendingAuth.reject(new Error('已被新的授權要求取代'));
+      pendingAuth = { resolve, reject };
+      try { initTokenClient().requestAccessToken(overrides); }
+      catch (e) { pendingAuth = null; reject(e); }
+    });
+  }
+
+  // 確保手上的 token 有效：先嘗試自動續期；失敗就暫停並請使用者按鈕重新授權，授權後從原處繼續
+  function ensureToken(force = false) {
+    if (!connectedOnce) return Promise.reject(new Error('尚未連線 Google'));
+    if (!force && tokenFresh()) return Promise.resolve();
+    if (reauthWaiter) return reauthWaiter;
+    reauthWaiter = (async () => {
+      try {
+        try { await Promise.race([requestToken({ prompt: '' }), timeout(20000)]); return; }
+        catch (e) { console.warn('自動續期失敗，改為手動重新授權:', e.message); }
+        await waitForManualReauth();
+      } finally { reauthWaiter = null; }
+    })();
+    return reauthWaiter;
+  }
+
+  function waitForManualReauth() {
+    return new Promise((resolve, reject) => {
+      const box = $('reauthBox'), ok = $('reauthBtn'), no = $('reauthCancel');
+      const cleanup = () => { box.hidden = true; ok.disabled = false; ok.removeEventListener('click', onOk); no.removeEventListener('click', onNo); };
+      const onOk = async () => {
+        ok.disabled = true;
+        try {
+          await requestToken({ prompt: '' });
+          cleanup();
+          $('uploadState').textContent = uploading ? '處理中' : '已連線';
+          resolve();
+        } catch (e) {
+          ok.disabled = false;
+          $('reauthMsg').textContent = `授權未完成（${e.message}），請再按一次「重新授權並繼續」。`;
+        }
+      };
+      const onNo = () => { cleanup(); const e = new Error('已放棄重新授權'); e.aborted = true; reject(e); };
+      $('reauthMsg').textContent = 'Google 授權已過期，無法自動續期。請按下方按鈕重新授權，備份會從目前的檔案繼續。';
+      box.hidden = false;
+      $('uploadState').textContent = '需要重新授權';
+      $('connection').textContent = '授權已過期'; $('connection').className = 'pill warn';
+      ok.addEventListener('click', onOk); no.addEventListener('click', onNo);
+    });
+  }
+
   // --- API 請求 ---
-  async function apiRequest(url, options={}) {
-    const headers = new Headers(options.headers || {});
-    headers.set('Authorization', 'Bearer ' + accessToken);
-    const response = await fetch(url, {...options, headers});
+  // 所有 Drive / People / Calendar 請求都經過這裡：先確保 token 有效，遇到 401 強制續期後重試一次
+  async function authFetch(url, options = {}) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await ensureToken(attempt > 0);
+      const headers = new Headers(options.headers || {});
+      headers.set('Authorization', 'Bearer ' + accessToken);
+      const response = await fetch(url, { ...options, headers });
+      if (response.status !== 401 || attempt === 1) return response;
+    }
+  }
+
+  async function apiRequest(url, options = {}) {
+    const response = await authFetch(url, options);
     if (!response.ok) {
       const body = await response.text();
-      if (response.status === 401) { accessToken = null; $('connection').textContent='連線逾時'; $('connection').className='pill warn'; refreshSelection(); }
-      throw new Error(`Google API ${response.status}: ${body.slice(0,500)}`);
+      const err = new Error(`Google API ${response.status}: ${body.slice(0, 500)}`);
+      err.status = response.status;
+      throw err;
     }
     return response.status === 204 ? null : response.json();
   }
 
-  async function getOrCreateFolder(folderName, parentId = null) {
-    let query = `name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-    if (parentId) query += ` and '${parentId}' in parents`;
-    const found = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=1`);
-    if (found.files && found.files.length > 0) return found.files[0].id;
-    const metadata = { name: folderName, mimeType: 'application/vnd.google-apps.folder' };
-    if (parentId) metadata.parents = [parentId];
-    const folder = await apiRequest('https://www.googleapis.com/drive/v3/files?fields=id', {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(metadata)
-    });
-    return folder.id;
+  // --- 資料夾（本次連線期間快取，省下重複查詢） ---
+  const ROOT_NAME = 'iPhone 手動備份';
+  const folderCache = new Map();
+  let rootFolderPromise = null;
+  const qEsc = v => String(v).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  const rootKey = () => 'iphoneBackupRootFolderId:' + $('clientId').value.trim();
+
+  function resetDriveCaches() { folderCache.clear(); rootFolderPromise = null; }
+
+  function getOrCreateFolder(folderName, parentId = null) {
+    const key = `${parentId || 'root'}/${folderName}`;
+    if (!folderCache.has(key)) {
+      const p = (async () => {
+        let query = `name = '${qEsc(folderName)}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+        if (parentId) query += ` and '${parentId}' in parents`;
+        const found = await apiRequest(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=1`);
+        if (found.files && found.files.length > 0) return found.files[0].id;
+        const metadata = { name: folderName, mimeType: 'application/vnd.google-apps.folder' };
+        if (parentId) metadata.parents = [parentId];
+        const folder = await apiRequest('https://www.googleapis.com/drive/v3/files?fields=id', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(metadata)
+        });
+        return folder.id;
+      })();
+      folderCache.set(key, p);
+      p.catch(() => folderCache.delete(key)); // 失敗的結果不要留在快取裡
+    }
+    return folderCache.get(key);
+  }
+
+  // 備份根資料夾 ID 記在本機；每次連線先驗證它還在（沒被刪除／丟進垃圾桶），避免重複建立同名根資料夾
+  function getRootFolderId() {
+    if (!rootFolderPromise) {
+      rootFolderPromise = (async () => {
+        const saved = localStorage.getItem(rootKey());
+        if (saved) {
+          try {
+            const f = await apiRequest(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(saved)}?fields=id,trashed,mimeType`);
+            if (f && !f.trashed && f.mimeType === 'application/vnd.google-apps.folder') return f.id;
+          } catch (e) { console.warn('已儲存的根資料夾無法使用，改為重新尋找:', e.message); }
+        }
+        const id = await getOrCreateFolder(ROOT_NAME);
+        try { localStorage.setItem(rootKey(), id); } catch (e) { /* 儲存失敗不影響備份 */ }
+        return id;
+      })();
+      rootFolderPromise.catch(() => { rootFolderPromise = null; });
+    }
+    return rootFolderPromise;
   }
 
   const MEDIA_EXT = /\.(jpe?g|png|heic|heif|gif|webp|tiff?|bmp|dng|avif|mov|mp4|m4v|3gp|avi|mkv)$/i;
@@ -375,16 +527,25 @@
   }
 
   async function uploadFileWithRetry(file, parentId, onProgress, uploadName, maxRetries = 3) {
+    let authRetries = 0;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
+        await ensureToken(); // 每次嘗試前確認 token 仍有效
         const result = await uploadFile(file, parentId, onProgress, uploadName);
         if (result.size && Number(result.size) !== file.size) throw new Error(`檔案大小不符 (本地: ${file.size}, 雲端: ${result.size})`);
         return result;
       } catch (err) {
+        if (err.aborted) throw err;
+        if (err.status === 401 && authRetries < 2) { // 授權過期不算一次失敗：續期後用同一次機會重來
+          authRetries++; attempt--;
+          if (onProgress) onProgress(0);
+          await ensureToken(true);
+          continue;
+        }
         console.warn(`第 ${attempt} 次上傳失敗:`, err);
         if (attempt === maxRetries) throw new Error(`重試 ${maxRetries} 次後仍失敗: ${err.message}`);
         await new Promise(resolve => setTimeout(resolve, 2000));
-        if(onProgress) onProgress(0);
+        if (onProgress) onProgress(0);
       }
     }
   }
@@ -404,7 +565,7 @@
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
           try { resolve(JSON.parse(xhr.responseText)); } catch(e) { reject(new Error('Google 回傳資料無法解析')); }
-        } else reject(new Error(`上傳失敗（HTTP ${xhr.status}）：${xhr.responseText.slice(0,400)}`));
+        } else { const e = new Error(`上傳失敗（HTTP ${xhr.status}）：${xhr.responseText.slice(0,400)}`); e.status = xhr.status; reject(e); }
       };
       xhr.onerror = () => reject(new Error('網路連線中斷，請確認網路後重試。'));
       xhr.onabort = () => reject(new Error('上傳已取消。'));
@@ -538,7 +699,7 @@
     try {
       let currentId = targetId;
       if (!currentId) {
-        currentId = await getOrCreateFolder('iPhone 手動備份');
+        currentId = await getRootFolderId();
         folderHistory = [{ id: currentId, name: 'iPhone 手動備份' }];
       } else {
         const existingIdx = folderHistory.findIndex(f => f.id === currentId);
@@ -601,9 +762,7 @@
   async function downloadFile(fileId, fileName, isBatch = false) {
     try {
       if (!isBatch) showResult(`正在準備下載：${fileName}...`, 'success');
-      const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-        headers: { 'Authorization': 'Bearer ' + accessToken }
-      });
+      const response = await authFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
       if (!response.ok) throw new Error(`下載失敗 (HTTP ${response.status})`);
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
@@ -642,8 +801,27 @@
   // --- 事件綁定 ---
   if ($('mediaPicker')) $('mediaPicker').addEventListener('change', e => addFiles(e.target.files));
   if ($('docPicker')) $('docPicker').addEventListener('change', e => addFiles(e.target.files));
-  if ($('includeContacts')) $('includeContacts').addEventListener('change', refreshSelection);
-  if ($('includeCalendar')) $('includeCalendar').addEventListener('change', refreshSelection);
+  // 勾選匯出的當下才請求唯讀授權（漸進授權）；這次點擊本身就是 iOS 要求的使用者手勢
+  async function onExportToggle(e, scope, label) {
+    const box = e.target;
+    if (box.checked && !hasScope(scope)) {
+      if (!accessToken) {
+        box.checked = false;
+        showResult('請先連線 Google，再勾選匯出。', 'error');
+      } else {
+        try {
+          await requestToken({ scope, include_granted_scopes: true });
+          if (!hasScope(scope)) throw new Error('授權視窗中未勾選此項目');
+        } catch (err) {
+          box.checked = false;
+          showResult(`未取得「${label}」讀取授權：${err.message}`, 'error');
+        }
+      }
+    }
+    refreshSelection();
+  }
+  if ($('includeContacts')) $('includeContacts').addEventListener('change', e => onExportToggle(e, SCOPE_CONTACTS, 'Google 聯絡人'));
+  if ($('includeCalendar')) $('includeCalendar').addEventListener('change', e => onExportToggle(e, SCOPE_CALENDAR, 'Google 行事曆'));
   
   if ($('clearSelection')) {
     $('clearSelection').addEventListener('click', () => {
@@ -665,40 +843,35 @@
         return; 
       }
       localStorage.setItem('iphoneDriveBackupClientId', id);
+      tokenClient = null; resetDriveCaches();
       if(msgEl) { msgEl.className = 'success'; msgEl.textContent = '已儲存用戶端 ID。請按「連線 Google」。'; }
     });
   }
 
   if ($('connect')) {
-    $('connect').addEventListener('click', () => {
+    $('connect').addEventListener('click', async () => {
       const id = $('clientId').value.trim();
       if (!id) { showResult('請先輸入 Google OAuth 用戶端 ID。','error'); return; }
       if (!window.google || !google.accounts || !google.accounts.oauth2) { showResult('Google 登入元件尚未載入，請確認網路連線後重試。','error'); return; }
       try {
-        tokenClient = google.accounts.oauth2.initTokenClient({
-          client_id: id,
-          scope: 'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/calendar.readonly',
-          callback: async (response) => {
-            if (response.error) { showResult('Google 授權失敗：' + response.error, 'error'); return; }
-            accessToken = response.access_token;
-            $('connection').textContent = '已連線'; $('connection').className = 'pill ok';
-            $('disconnect').disabled = false;
-            $('uploadState').textContent = '已連線';
-            refreshSelection();
-            showResult('Google Drive 已連線。現在可以選取檔案並備份。','success');
-            loadCloudFiles();
-          },
-          error_callback: (error) => showResult('Google 登入視窗發生問題：' + (error.message || error.type || '未知錯誤'), 'error')
-        });
-        tokenClient.requestAccessToken({prompt: 'consent'});
-      } catch (err) { showResult('無法啟動 Google 登入：' + err.message, 'error'); }
+        resetDriveCaches();
+        grantedScopes = new Set();
+        await requestToken({ prompt: '' });
+        if (!hasScope(SCOPE_DRIVE)) throw new Error('未授予 Google Drive 權限，無法備份');
+        $('disconnect').disabled = false;
+        $('uploadState').textContent = '已連線';
+        refreshSelection();
+        showResult('Google Drive 已連線。現在可以選取檔案並備份。','success');
+        loadCloudFiles();
+      } catch (err) { showResult('Google 授權失敗：' + err.message, 'error'); }
     });
   }
 
   if ($('disconnect')) {
     $('disconnect').addEventListener('click', () => {
       if (accessToken && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(accessToken, () => {});
-      accessToken = null; 
+      accessToken = null; tokenExpiresAt = 0; connectedOnce = false; grantedScopes = new Set(); resetDriveCaches();
+      if ($('reauthBox')) $('reauthBox').hidden = true;
       $('connection').textContent = '尚未連線'; $('connection').className = 'pill warn';
       $('disconnect').disabled = true; $('uploadState').textContent = '待命'; refreshSelection();
       showResult('已清除本頁的連線狀態。');
@@ -714,9 +887,18 @@
       const wantContacts = $('includeContacts') && $('includeContacts').checked;
       const wantCalendar = $('includeCalendar') && $('includeCalendar').checked;
       if (selectedFiles.length === 0 && !wantContacts && !wantCalendar) return;
+      if (wantContacts && !hasScope(SCOPE_CONTACTS)) { showResult('尚未授權讀取聯絡人，請取消勾選後重新勾選一次。', 'error'); return; }
+      if (wantCalendar && !hasScope(SCOPE_CALENDAR)) { showResult('尚未授權讀取行事曆，請取消勾選後重新勾選一次。', 'error'); return; }
 
       uploading = true; $('backup').disabled = true; $('progress').hidden = false; $('progress').value = 0;
       $('uploadState').textContent = '準備中'; showResult('');
+
+      // 先確認授權有效（若需要續期，此時仍在使用者點擊的手勢內，彈窗較不會被 iOS 擋下）
+      try { await ensureToken(); }
+      catch (err) {
+        showResult('授權未完成：' + err.message, 'error'); $('uploadState').textContent = '失敗';
+        uploading = false; refreshSelection(); return;
+      }
 
       let success = 0; const skipped = [], renamed = [], failures = [], notes = [];
       const generated = []; // 產生的 .vcf/.ics 另外存放，不混進使用者的選取清單
@@ -731,9 +913,10 @@
       }
 
       const jobs = [...selectedFiles, ...generated];
+      let stoppedAt = -1;
 
       try {
-        const rootFolderId = await getOrCreateFolder('iPhone 手動備份');
+        const rootFolderId = await getRootFolderId();
 
         for (let i = 0; i < jobs.length; i++) {
           const file = jobs[i];
@@ -756,10 +939,14 @@
               if (dup.uploadName !== file.name) renamed.push(`${file.name} → ${dup.uploadName}`);
               success++;
             }
-          } catch (err) { failures.push(`${file.name}：${err.message}`); }
+          } catch (err) {
+            failures.push(`${file.name}：${err.message}`);
+            if (err.aborted) { stoppedAt = i; break; } // 使用者放棄重新授權：停止後續檔案
+          }
           $('progress').value = ((i + 1) / jobs.length) * 100;
         }
 
+        if (stoppedAt >= 0 && stoppedAt < jobs.length - 1) failures.push(`其餘 ${jobs.length - stoppedAt - 1} 個檔案未處理（已放棄重新授權）`);
         $('uploadState').textContent = failures.length ? '部分完成' : '完成';
         let resultMsg = `備份完成！\n成功上傳：${success} 個`;
         if (notes.length) resultMsg += `\n（${notes.join('、')}）`;
