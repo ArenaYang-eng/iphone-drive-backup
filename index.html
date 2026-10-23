@@ -37,16 +37,12 @@
     details summary { cursor:pointer; font-weight:600; color:var(--blue); padding:8px 0; }
     input[type=text] { width:100%; padding:12px; border:1px solid #bcc9d4; border-radius:10px; font-size:15px; }
     footer { text-align:center; color:var(--muted); font-size:12px; margin-top:20px; }
-
-    /* Tab 切換樣式 */
     .tabs { display:flex; margin-bottom:16px; background:#e2e8f0; padding:4px; border-radius:12px; }
     .tab-btn { flex:1; text-align:center; padding:10px; font-size:14px; font-weight:600; color:var(--muted); border-radius:9px; cursor:pointer; border:none; background:transparent; transition:0.2s; }
     .tab-btn.active { background:white; color:var(--blue); box-shadow:0 2px 4px #0000000d; }
     .tab-content { display:none; }
     .tab-content.active { display:block; animation:fadeIn 0.3s; }
     @keyframes fadeIn { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:translateY(0); } }
-    
-    /* 雲端清單／紀錄（由 JS 以 DOM 建立，不用 inline style） */
     .cloud-row { padding:8px 0; border-bottom:1px dashed #eee; display:flex; justify-content:space-between; align-items:center; gap:8px; }
     .cloud-info { min-width:0; overflow-wrap:anywhere; }
     .cloud-folder { color:var(--blue); cursor:pointer; font-weight:700; }
@@ -59,9 +55,10 @@
     .warnbox { background:#fff8e6; border:1px solid #f0c36d; border-radius:10px; padding:10px 12px; margin:10px 0; font-size:13px; line-height:1.55; color:#5c3d00; }
     .update-bar { position:sticky; top:0; z-index:10; display:flex; gap:10px; align-items:center; justify-content:space-between; background:#e8f1f8; border:1px solid #b9d4ea; border-radius:12px; padding:8px 12px; margin:0 0 12px; font-size:13px; color:#154f7e; }
     .update-bar button { min-height:34px; padding:6px 12px; font-size:13px; flex:none; }
-
-    /* 說明區塊微調 */
     .info-box { background:#f8fafc; border-left:4px solid var(--blue); padding:10px 12px; border-radius:0 8px 8px 0; margin:10px 0; }
+    .hist-detail { font-size:12px; color:var(--muted); border-top:1px dashed #eee; margin-top:8px; padding-top:8px; }
+    .hist-file { padding:2px 0; overflow-wrap:anywhere; }
+    .hist-file.ok { color:#17633a; } .hist-file.fail { color:#a52a2a; } .hist-file.skip { color:#5f6b76; }
   </style>
 </head>
 <body>
@@ -77,11 +74,10 @@
         <h1>我的備份中心</h1>
         <div class="sub">iPhone → Google Drive｜手動選取版 A</div>
       </div>
-      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v3.8</span>
+      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v3.9</span>
     </div>
   </header>
 
-  <!-- Tab 導覽列 -->
   <div class="tabs">
     <button class="tab-btn active" data-target="tab-backup">📤 備份資料</button>
     <button class="tab-btn" data-target="tab-cloud">☁️ 雲端還原</button>
@@ -105,18 +101,16 @@
 
     <section class="card">
       <h2>2. 選取要備份的資料</h2>
-      
       <label class="picker">
         <strong>📷 照片與影片</strong>
         <span class="sub">可多選；系統會讀取拍攝時間（照片讀 EXIF，影片或無 EXIF 者用檔案時間），分類到「年份/月份」資料夾。</span>
         <input id="mediaPicker" type="file" accept="image/*,video/*" multiple>
       </label>
       <div id="exifrWarn" class="warnbox" role="alert" hidden>⚠️ EXIF 解析套件沒有載入成功。照片會改用「檔案修改時間」分類，可能被放到錯誤的年月或「未分類照片」。請重新整理頁面；若持續發生，請檢查部署是否包含 exifr.full.umd.js。</div>
-      
+
       <div class="info-box">
         <p class="hint" style="margin:0 0 8px 0; font-weight:bold; color:var(--ink);">匯出 Google 帳號資料</p>
         <p class="hint" style="margin:0 0 10px 0;">勾選後，系統會自動向 Google 取得資料，並打包成通用備份檔（.vcf 與 .ics），存入雲端「其他檔案」資料夾，檔名會帶日期時間，每次都是新的一份。僅限 Google 帳號內的聯絡人與行事曆；iPhone 本機或 iCloud 通訊錄請先在「通訊錄」App 匯出 .vcf，再從下方「文件與其他檔案」選取。</p>
-        
         <label style="display:flex; align-items:center; gap:8px; padding:10px; background:white; border:1px solid #dce3e9; border-radius:8px; margin-bottom:8px; cursor:pointer;">
           <input type="checkbox" id="includeContacts" style="width:20px; height:20px; margin:0;">
           <strong>👤 匯出 Google 聯絡人 (.vcf)</strong>
@@ -137,10 +131,10 @@
 
       <label class="picker">
         <strong>📁 文件與其他檔案</strong>
-        <span class="sub">從 iPhone「檔案」App 選取；可多選。上傳後會存入「其他檔案」資料夾。</span>
+        <span class="sub">從 iPhone「檔案」App 選取；可多選。上傳後會存入「其他檔案」資料夾。iPhone 本機通訊錄可先於「通訊錄」App 匯出 .vcf 後由此選取。</span>
         <input id="docPicker" type="file" multiple>
       </label>
-      
+
       <div class="row">
         <button id="clearSelection" class="secondary">清除選取清單</button>
         <span id="selectionCount" class="pill">尚未選取檔案</span>
@@ -153,6 +147,10 @@
     <section class="card">
       <div class="status"><h2>3. 執行備份</h2><span id="uploadState" class="pill">待命</span></div>
       <p class="sub">開始前會先檢查 Google 雲端剩餘空間；上傳前會檢查雲端是否已有「同名且大小相同」的檔案，避免重複佔用空間；同名但內容不同的會自動改名保留。單檔上傳失敗時系統會自動重試，仍失敗的檔案可事後按「只重試」。備份期間會保持螢幕亮起。</p>
+      <label style="display:flex; align-items:center; gap:8px; padding:10px; margin:0 0 10px; background:#f8fafc; border-radius:8px;">
+        <input type="checkbox" id="md5Verify" style="width:20px; height:20px; margin:0;" checked>
+        <span class="hint" style="margin:0;">上傳後比對 MD5 檢查碼（檔案 ≤ 100MB 才驗證，較慢但更可靠）</span>
+      </label>
       <button id="backup" class="full" disabled>備份所選資料到 Google Drive</button>
       <button id="cancelBackup" class="secondary full" type="button" style="margin-top:8px;" hidden>取消備份</button>
       <button id="retryFailed" class="secondary full" type="button" style="margin-top:8px;" hidden>只重試失敗／未完成的檔案</button>
@@ -167,12 +165,21 @@
       <progress id="progress" max="100" value="0" hidden></progress>
       <div id="progressText" class="hint" aria-live="polite"></div>
       <div id="result" style="margin-top:10px" aria-live="polite"></div>
-      
+
       <div style="margin-top:20px; border-top:1px solid #edf0f3; padding-top:15px;">
-        <h3 style="font-size:15px; margin:0 0 10px; color:var(--ink);">📜 最近備份紀錄</h3>
+        <div class="status" style="margin-bottom:10px;">
+          <h3 style="font-size:15px; margin:0; color:var(--ink);">📜 備份紀錄</h3>
+          <button id="toggleHistory" class="secondary btn-small" type="button">顯示詳細</button>
+        </div>
+        <div id="lastBackupInfo" class="hint" style="margin-bottom:10px;">尚無備份紀錄</div>
         <ul id="historyList" style="font-size:13px; color:var(--muted);">
           <li>尚無備份紀錄</li>
         </ul>
+        <div id="historyDetail" hidden style="margin-top:10px;"></div>
+        <div class="row" style="margin-top:10px;">
+          <button id="exportHistory" class="secondary btn-small" type="button">匯出 JSON</button>
+          <button id="clearHistory" class="secondary btn-small" type="button">清除紀錄</button>
+        </div>
       </div>
     </section>
   </div>
@@ -184,12 +191,13 @@
         <h2>☁️ 雲端檔案瀏覽器</h2>
         <button id="loadCloudFiles" class="secondary" style="min-height:32px; padding:6px 12px; font-size:13px;">重新整理</button>
       </div>
-      <p class="hint" style="margin-bottom:12px;">可直接點擊資料夾（藍色字體）進入查看。若要將整批照片存回手機，可點擊下方的「一鍵下載」按鈕。</p>
-      
+      <p class="hint" style="margin-bottom:12px;">可直接點擊資料夾（藍色字體）進入查看。個別檔案可「下載」或「分享（存到相簿／檔案）」。整批下載請用 ZIP，避免 iOS 對連續下載的攔截。</p>
+
       <div id="folderBreadcrumb" style="margin-bottom:10px; font-size:12px; color:var(--muted);"></div>
-      
-      <div id="batchActionBar" style="display:none; margin-bottom:10px;">
-         <button id="btnDownloadFolder" class="full" style="background:#e8f1f8; color:#154f7e; min-height:38px; font-size:14;">⬇️ 下載此資料夾所有檔案</button>
+
+      <div id="batchActionBar" style="display:none; margin-bottom:10px; gap:8px; flex-direction:column;">
+        <button id="btnDownloadFolder" class="full" style="background:#e8f1f8; color:#154f7e; min-height:38px; font-size:14px;">⬇️ 打包成 ZIP 下載（此資料夾）</button>
+        <button id="btnShareFolder" class="full secondary" style="min-height:38px; font-size:14px;">📤 逐檔分享（存到相簿／檔案）</button>
       </div>
 
       <ul id="cloudFileList" style="font-size:13px; color:var(--muted); max-height: 400px; overflow-y: auto;">
@@ -203,7 +211,6 @@
     <section class="card">
       <h2>📖 備份檔還原指南</h2>
       <p class="hint" style="margin-bottom:12px;">如果你下載了聯絡人或行事曆備份檔，請依照以下步驟還原至 iPhone：</p>
-      
       <details open>
         <summary>👤 如何還原 Google 聯絡人 (.vcf)</summary>
         <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
@@ -212,13 +219,31 @@
           3. iOS 會跳出聯絡人預覽，點擊「新增所有聯絡人」即可匯入。
         </div>
       </details>
-      
       <details>
         <summary>📅 如何還原 Google 行事曆 (.ics)</summary>
         <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
           1. 在「雲端還原」頁籤下載 <code>Google_Calendar_日期時間.ics</code>。<br>
           2. 打開「檔案」App，點擊該檔案。<br>
           3. 在跳出的選單中點擊「行事曆」，選擇要加入的行事曆後確認即可。
+        </div>
+      </details>
+    </section>
+
+    <section class="card">
+      <h2>📱 iPhone 本機聯絡人／行事曆</h2>
+      <p class="hint" style="margin-bottom:10px;">本網頁無法直接讀取 iPhone 本機或 iCloud 的資料，請先在 iPhone 上匯出，再用上方「文件與其他檔案」選取上傳。</p>
+      <details open>
+        <summary>👤 匯出 iPhone 聯絡人（.vcf）</summary>
+        <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
+          1. 開啟 iPhone「通訊錄」App，按住要匯出的聯絡人 →「分享聯絡人」（或全選）。<br>
+          2. 選擇「儲存到『檔案』」到「我的 iPhone」或 iCloud Drive。<br>
+          3. 回到本頁，於「文件與其他檔案」選取該 .vcf 檔備份。
+        </div>
+      </details>
+      <details>
+        <summary>📅 匯出 iPhone 行事曆（.ics）</summary>
+        <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
+          iPhone 內建行事曆 App 不支援直接匯出 .ics；建議在 Mac 上使用「行事曆」App 匯出，或使用支援匯出的第三方 App。若使用 Google 行事曆，可直接勾選「匯出 Google 行事曆」。
         </div>
       </details>
     </section>
@@ -241,7 +266,8 @@
         <li>聯絡人與行事曆是「唯讀」權限，只在您勾選匯出的當下才會請求；資料只用來在您的手機上產生備份檔，並上傳到您自己的 Drive，不會傳到其他地方。</li>
         <li>授權金鑰（Access Token）只暫存在瀏覽器記憶體中，約 1 小時後失效，重新整理網頁也會清除。EXIF 解析套件（exifr 7.1.3）已隨本站一起部署，不從第三方網站載入；唯一的外部腳本是 Google 登入元件。本頁並設有內容安全政策（CSP），限制可載入的腳本與可連線的網址。</li>
         <li>長時間備份時授權可能過期：本頁會先嘗試自動續期，失敗時會暫停並顯示「重新授權並繼續」，授權後從原本的檔案接著做。</li>
-        <li>此裝置的瀏覽器會儲存：用戶端 ID、備份根資料夾 ID、最近 5 筆備份的數量統計（沒有檔名），以及「本機備份帳本」——記錄已備份檔案的檔名、大小、修改時間與對應的 Drive 檔案 ID（用來跳過已備份的檔案）。帳本只存在本機，不會上傳，可在「設定」頁清除；不會儲存授權金鑰。</li>
+        <li>此裝置的瀏覽器會儲存：用戶端 ID、備份根資料夾 ID、最近 5 筆備份的數量統計（沒有檔名），以及「本機備份帳本」與「備份紀錄」——記錄已備份檔案的檔名、大小、修改時間與對應的 Drive 檔案 ID。只存在本機，不會上傳，可在本頁清除；不會儲存授權金鑰。</li>
+        <li>啟用 MD5 驗證時，檔案內容會在本機瀏覽器計算檢查碼並與 Drive 回傳的 <code>md5Checksum</code> 比對；大於 100MB 的檔案會跳過以維持效能。</li>
         <li>請勿在公用電腦上儲存您的 Client ID，或在公共場所進行大量備份。</li>
         <li>備份期間本頁會要求螢幕保持亮起（需要 iOS 16.4 以上；若顯示無法啟用，請手動保持亮起）。切換 App 或鎖定螢幕時 iOS 仍可能中斷上傳，中斷的檔案可按「只重試失敗／未完成的檔案」。</li>
       </ul>
