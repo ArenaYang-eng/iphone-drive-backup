@@ -32,17 +32,20 @@
     .filemeta { color:var(--muted); font-size:12px; margin-top:4px; }
     progress { width:100%; height:12px; margin:10px 0; accent-color:var(--blue); }
     .success { color:#17633a; } .error { color:#a52a2a; white-space:pre-wrap; }
-    details summary { cursor:pointer; font-weight:600; }
+    details summary { cursor:pointer; font-weight:600; color:var(--blue); padding:8px 0; }
     input[type=text] { width:100%; padding:12px; border:1px solid #bcc9d4; border-radius:10px; font-size:15px; }
     footer { text-align:center; color:var(--muted); font-size:12px; margin-top:20px; }
 
-    /* 新增：Tab 切換樣式 */
+    /* Tab 切換樣式 */
     .tabs { display:flex; margin-bottom:16px; background:#e2e8f0; padding:4px; border-radius:12px; }
     .tab-btn { flex:1; text-align:center; padding:10px; font-size:14px; font-weight:600; color:var(--muted); border-radius:9px; cursor:pointer; border:none; background:transparent; transition:0.2s; }
     .tab-btn.active { background:white; color:var(--blue); box-shadow:0 2px 4px #0000000d; }
     .tab-content { display:none; }
     .tab-content.active { display:block; animation:fadeIn 0.3s; }
     @keyframes fadeIn { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:translateY(0); } }
+    
+    /* 說明區塊微調 */
+    .info-box { background:#f8fafc; border-left:4px solid var(--blue); padding:10px 12px; border-radius:0 8px 8px 0; margin:10px 0; }
   </style>
 </head>
 <body>
@@ -54,7 +57,7 @@
         <h1>我的備份中心</h1>
         <div class="sub">iPhone → Google Drive｜手動選取版 A</div>
       </div>
-      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v3.3</span>
+      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v3.4</span>
     </div>
   </header>
 
@@ -62,14 +65,14 @@
   <div class="tabs">
     <button class="tab-btn active" data-target="tab-backup">📤 備份資料</button>
     <button class="tab-btn" data-target="tab-cloud">☁️ 雲端還原</button>
-    <button class="tab-btn" data-target="tab-settings">⚙️ 設定</button>
+    <button class="tab-btn" data-target="tab-settings">⚙️ 設定與說明</button>
   </div>
 
   <!-- Tab 1: 備份資料 -->
   <div id="tab-backup" class="tab-content active">
     <section class="card">
       <div class="status"><h2>1. Google Drive 連線</h2><span id="connection" class="pill warn">尚未連線</span></div>
-      <p class="sub">首次設定需要建立 Google OAuth 用戶端 ID。登入後，本頁只取得暫時存取權杖；不會把權杖儲存在本機。</p>
+      <p class="hint" style="margin-bottom:8px;">首次設定需要建立 Google OAuth 用戶端 ID。登入後，本頁只取得暫時存取權杖；不會把權杖儲存在本機。</p>
       <label for="clientId" class="sub">Google OAuth 2.0 用戶端 ID</label>
       <input id="clientId" type="text" placeholder="例如：123456789-xxxx.apps.googleusercontent.com" autocomplete="off" autocapitalize="none" spellcheck="false">
       <div class="row" style="margin-top:10px">
@@ -82,26 +85,33 @@
 
     <section class="card">
       <h2>2. 選取要備份的資料</h2>
+      
       <label class="picker">
         <strong>📷 照片與影片</strong>
-        <span class="sub">可多選；iPhone 會開啟照片選取介面。</span>
+        <span class="sub">可多選；系統會自動讀取拍攝時間，分類到「年份/月份」資料夾。</span>
         <input id="mediaPicker" type="file" accept="image/*,video/*" multiple>
       </label>
       
-      <label style="display:flex; align-items:center; gap:8px; padding:10px 14px; border:1px solid #bcc9d4; border-radius:12px; margin:10px 0; cursor:pointer;">
-        <input type="checkbox" id="includeContacts" style="width:20px; height:20px; margin:0;">
-        <strong>👤 匯出 Google 聯絡人 (.vcf)</strong>
-      </label>
-      <label style="display:flex; align-items:center; gap:8px; padding:10px 14px; border:1px solid #bcc9d4; border-radius:12px; margin:10px 0; cursor:pointer;">
-        <input type="checkbox" id="includeCalendar" style="width:20px; height:20px; margin:0;">
-        <strong>📅 匯出 Google 行事曆 (.ics)</strong>
-      </label>
+      <div class="info-box">
+        <p class="hint" style="margin:0 0 8px 0; font-weight:bold; color:var(--ink);">匯出 Google 帳號資料</p>
+        <p class="hint" style="margin:0 0 10px 0;">勾選後，系統會自動向 Google 取得資料，並打包成通用備份檔（.vcf 與 .ics），存入雲端「其他檔案」資料夾。</p>
+        
+        <label style="display:flex; align-items:center; gap:8px; padding:10px; background:white; border:1px solid #dce3e9; border-radius:8px; margin-bottom:8px; cursor:pointer;">
+          <input type="checkbox" id="includeContacts" style="width:20px; height:20px; margin:0;">
+          <strong>👤 匯出 Google 聯絡人 (.vcf)</strong>
+        </label>
+        <label style="display:flex; align-items:center; gap:8px; padding:10px; background:white; border:1px solid #dce3e9; border-radius:8px; cursor:pointer;">
+          <input type="checkbox" id="includeCalendar" style="width:20px; height:20px; margin:0;">
+          <strong>📅 匯出 Google 行事曆 (.ics)</strong>
+        </label>
+      </div>
 
       <label class="picker">
         <strong>📁 文件與其他檔案</strong>
-        <span class="sub">從 iPhone「檔案」App 選取；可多選。</span>
+        <span class="sub">從 iPhone「檔案」App 選取；可多選。上傳後會存入「其他檔案」資料夾。</span>
         <input id="docPicker" type="file" multiple>
       </label>
+      
       <div class="row">
         <button id="clearSelection" class="secondary">清除選取清單</button>
         <span id="selectionCount" class="pill">尚未選取檔案</span>
@@ -111,7 +121,7 @@
 
     <section class="card">
       <div class="status"><h2>3. 執行備份</h2><span id="uploadState" class="pill">待命</span></div>
-      <p class="sub">檔案會依拍攝時間自動分類到「年份/月份」資料夾。若已有同名檔案，系統會自動跳過。</p>
+      <p class="sub">上傳前會自動檢查雲端是否已有同名檔案，避免重複佔用空間。上傳失敗時系統會自動重試。</p>
       <button id="backup" class="full" disabled>備份所選資料到 Google Drive</button>
       <progress id="progress" max="100" value="0" hidden></progress>
       <div id="progressText" class="hint" aria-live="polite"></div>
@@ -133,11 +143,12 @@
         <h2>☁️ 雲端檔案瀏覽器</h2>
         <button id="loadCloudFiles" class="secondary" style="min-height:32px; padding:6px 12px; font-size:13px;">重新整理</button>
       </div>
+      <p class="hint" style="margin-bottom:12px;">可直接點擊資料夾（藍色字體）進入查看。若要將整批照片存回手機，可點擊下方的「一鍵下載」按鈕。</p>
+      
       <div id="folderBreadcrumb" style="margin-bottom:10px; font-size:12px; color:var(--muted);"></div>
       
-      <!-- 新增：批次下載按鈕 -->
       <div id="batchActionBar" style="display:none; margin-bottom:10px;">
-         <button id="btnDownloadFolder" class="full" style="background:#e8f1f8; color:#154f7e; min-height:38px; font-size:14px;">⬇️ 下載此資料夾所有檔案</button>
+         <button id="btnDownloadFolder" class="full" style="background:#e8f1f8; color:#154f7e; min-height:38px; font-size:14;">⬇️ 下載此資料夾所有檔案</button>
       </div>
 
       <ul id="cloudFileList" style="font-size:13px; color:var(--muted); max-height: 400px; overflow-y: auto;">
@@ -146,15 +157,38 @@
     </section>
   </div>
 
-  <!-- Tab 3: 設定 -->
+  <!-- Tab 3: 設定與說明 -->
   <div id="tab-settings" class="tab-content">
     <section class="card">
-      <h2>設定與安全說明</h2>
-      <ul style="padding-left:18px;list-style:disc;margin-top:10px; line-height:1.6;">
-        <li>此版本使用 Google Drive 的 <code>drive.file</code> 範圍，目標是只管理本工具建立或由本工具開啟的檔案。</li>
-        <li>若要公開提供其他人使用，應先完成 OAuth 同意畫面、隱私權說明及必要的 Google 驗證流程。</li>
-        <li>網頁上傳時請保持頁面開啟。iOS 可能在切換 App、鎖定螢幕或網路中斷時暫停工作。</li>
-        <li>目前已支援：時間分類、失敗重試、跳過重複、歷史紀錄、雲端還原、聯絡人/行事曆匯出。</li>
+      <h2>📖 備份檔還原指南</h2>
+      <p class="hint" style="margin-bottom:12px;">如果你下載了聯絡人或行事曆備份檔，請依照以下步驟還原至 iPhone：</p>
+      
+      <details open>
+        <summary>👤 如何還原 Google 聯絡人 (.vcf)</summary>
+        <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
+          1. 在「雲端還原」頁籤下載 <code>Google_Contacts.vcf</code>。<br>
+          2. 打開 iPhone 的「檔案」App，找到該檔案並點擊。<br>
+          3. iOS 會跳出聯絡人預覽，點擊「新增所有聯絡人」即可匯入。
+        </div>
+      </details>
+      
+      <details>
+        <summary>📅 如何還原 Google 行事曆 (.ics)</summary>
+        <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
+          1. 在「雲端還原」頁籤下載 <code>Google_Calendar.ics</code>。<br>
+          2. 打開「檔案」App，點擊該檔案。<br>
+          3. 在跳出的選單中點擊「行事曆」，選擇要加入的行事曆後確認即可。
+        </div>
+      </details>
+    </section>
+
+    <section class="card">
+      <h2>🛡️ 安全與隱私說明</h2>
+      <ul style="padding-left:18px; list-style:disc; margin-top:10px; line-height:1.6; font-size:13px; color:var(--muted);">
+        <li>本工具為純前端網頁，使用 Google 的 <code>drive.file</code> 權限，僅能存取「由本工具建立」的檔案，無法偷看您雲端硬碟的其他資料。</li>
+        <li>您的 Google 授權金鑰（Access Token）只暫存在瀏覽器記憶體中，重新整理網頁即失效，不會被惡意竊取。</li>
+        <li>請勿在公用電腦上儲存您的 Client ID，或在公共場所進行大量備份。</li>
+        <li>iOS 系統在螢幕鎖定或切換 App 時可能會暫停網頁運作，備份期間請保持螢幕亮起。</li>
       </ul>
     </section>
   </div>
@@ -166,7 +200,7 @@
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (() => {
-  const APP_VERSION = 'v4.0';
+  const APP_VERSION = 'v3.4';
   const $ = id => document.getElementById(id);
   
   const verEl = $('versionDisplay');
@@ -177,7 +211,7 @@
   let selectedFiles = [];
   let folderHistory = [];
   let uploading = false;
-  let currentFolderFiles = []; // 紀錄目前資料夾的檔案，用於批次下載
+  let currentFolderFiles = []; 
 
   const savedClientId = localStorage.getItem('iphoneDriveBackupClientId') || '';
   if ($('clientId')) $('clientId').value = savedClientId;
@@ -437,7 +471,6 @@
         listEl.appendChild(li);
       });
 
-      // 如果有檔案，顯示批次下載按鈕
       if (currentFolderFiles.length > 0 && batchBar) {
         batchBar.style.display = 'block';
       }
@@ -466,7 +499,6 @@
     }
   }
 
-  // --- 批次下載 ---
   async function batchDownload() {
     if (currentFolderFiles.length === 0) return;
     const btn = $('btnDownloadFolder');
@@ -479,7 +511,6 @@
       btn.textContent = `⏳ 正在下載 (${i+1}/${currentFolderFiles.length})...`;
       const ok = await downloadFile(file.id, file.name, true);
       if (ok) successCount++;
-      // 延遲 500ms 避免瀏覽器阻擋連續下載
       await new Promise(r => setTimeout(r, 500));
     }
     
