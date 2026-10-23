@@ -1,0 +1,10 @@
+# Cloudflare（Workers Assets / Pages）會讀取此檔；其他主機請在伺服器設定同等標頭。
+# frame-ancestors 無法寫在 <meta> CSP，只能由標頭提供（防止被別的網站用 iframe 嵌入）。
+/
+  Content-Security-Policy: default-src 'self'; script-src 'self' https://accounts.google.com/gsi/client; style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/style; img-src 'self' data:; connect-src 'self' https://www.googleapis.com https://people.googleapis.com https://oauth2.googleapis.com https://accounts.google.com/; frame-src https://accounts.google.com/; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+/index.html
+  Content-Security-Policy: default-src 'self'; script-src 'self' https://accounts.google.com/gsi/client; style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/style; img-src 'self' data:; connect-src 'self' https://www.googleapis.com https://people.googleapis.com https://oauth2.googleapis.com https://accounts.google.com/; frame-src https://accounts.google.com/; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+/*.js
+  X-Content-Type-Options: nosniff
