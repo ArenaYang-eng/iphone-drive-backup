@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1769aa">
+  <title>隱私權政策 - 我的備份中心</title>
+  <style>
+    :root { color-scheme: light; --blue:#1769aa; --ink:#18212b; --muted:#5f6b76; --line:#dce3e9; --bg:#f4f7fa; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); line-height: 1.6; }
+    main { max-width:720px; margin:0 auto; padding:20px 16px calc(32px + env(safe-area-inset-bottom)); }
+    header { margin: 20px 0; border-bottom: 2px solid var(--line); padding-bottom: 10px; }
+    h1 { font-size: 24px; color: var(--blue); margin: 0; }
+    h2 { font-size: 18px; margin-top: 24px; color: var(--ink); }
+    p, ul { font-size: 15px; color: var(--ink); }
+    ul { padding-left: 20px; }
+    li { margin-bottom: 8px; }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .back-btn { display: inline-block; margin-top: 30px; padding: 10px 16px; background: var(--blue); color: white; border-radius: 8px; text-decoration: none; font-weight: bold; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>隱私權政策</h1>
+    <p style="color: var(--muted); font-size: 13px; margin-top: 5px;">最後更新日期：2023年10月（可自行修改）</p>
+  </header>
+
+  <p>歡迎使用「我的備份中心」（以下簡稱本工具）。我們非常重視您的隱私，本政策將說明本工具如何處理您的資料。</p>
+
+  <h2>1. 我們存取的資料與權限</h2>
+  <ul>
+    <li><strong>Google Drive (<code>drive.file</code>)：</strong> 本工具僅能存取「由本工具建立」的檔案，<strong>無法</strong>讀取您雲端硬碟中的其他資料。備份的檔案會存放在您自己的 Google Drive 空間中。</li>
+    <li><strong>Google 聯絡人與行事曆 (<code>contacts.readonly</code>, <code>calendar.readonly</code>)：</strong> 這是唯讀權限，且僅在您主動勾選匯出時才會請求。資料僅用於在您的裝置上產生備份檔（.vcf / .ics）並上傳至您的 Drive，不會傳送到任何第三方伺服器。</li>
+  </ul>
+
+  <h2>2. 資料儲存方式</h2>
+  <ul>
+    <li><strong>授權金鑰（Access Token）：</strong> 僅暫存於您的瀏覽器記憶體中，約 1 小時後失效，重新整理網頁即清除。我們不會將金鑰儲存在本機或上傳。</li>
+    <li><strong>本機資料：</strong> 您的瀏覽器會透過 <code>localStorage</code> 與 <code>IndexedDB</code> 儲存：Google OAuth 用戶端 ID、備份根資料夾 ID、備份紀錄（包含檔名、大小、時間），以及「本機備份帳本」（用來跳過已備份的檔案）。<strong>這些資料只存在您的裝置上，絕對不會上傳到我們的伺服器。</strong></li>
+  </ul>
+
+  <h2>3. 資料分享與第三方服務</h2>
+  <ul>
+    <li>本工具為純靜態網頁應用程式（PWA），沒有後端伺服器。您的檔案直接從瀏覽器上傳到 Google API。</li>
+    <li>本工具唯一使用的外部腳本是 Google 官方登入元件（Google Identity Services）。除此之外，不包含任何追蹤碼、廣告或第三方分析工具。</li>
+  </ul>
+
+  <h2>4. 如何撤銷權限與刪除資料</h2>
+  <ul>
+    <li>您可以隨時在本工具網頁點擊「清除狀態」來登出。</li>
+    <li>若要永久撤銷本工具的存取權，請前往您的 <a href="https://myaccount.google.com/permissions" target="_blank" rel="noopener">Google 帳號權限設定頁面</a>，找到本工具並點擊「移除存取權」。</li>
+    <li>若要清除本機的備份紀錄與帳本，可在本工具的「設定與說明」頁籤中點擊「清除本機帳本」與「清除紀錄」。</li>
+  </ul>
+
+  <a href="./index.html" class="back-btn">⬅️ 返回應用程式</a>
+</main>
+</body>
+</html>

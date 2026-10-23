@@ -1,5 +1,5 @@
 const CACHE_PREFIX = 'iphone-drive-backup-';
-const CACHE_NAME = CACHE_PREFIX + 'v11';
+const CACHE_NAME = CACHE_PREFIX + 'v12';
 const APP_SHELL = [
   './', './index.html', './app.js', './exifr.full.umd.js',
   './manifest.webmanifest', './icon-192.png', './icon-512.png'
