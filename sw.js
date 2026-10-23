@@ -1,4 +1,4 @@
-const CACHE_NAME = 'iphone-drive-backup-v5.2'; // 請確保是 v3 或以上
+const CACHE_NAME = 'iphone-drive-backup-v6'; // 請確保是 v3 或以上
 const APP_SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', event => {
