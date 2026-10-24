@@ -1,5 +1,5 @@
 (() => {
-  const APP_VERSION = 'v3.9';
+  const APP_VERSION = 'v4.1';
   const $ = id => document.getElementById(id);
   
   const verEl = $('versionDisplay');
@@ -16,6 +16,7 @@
   let failedJobs = [];          // 失敗＋未處理的 File，供「只重試」使用
   let wakeLock = null;
   let hiddenDuringUpload = false;
+  let dlDiag = null;              // 進行中的單檔下載診斷（供畫面離開／網路事件記錄）
   let exifrMissingCount = 0;
   let swReg = null;
   let syncUpdateBar = () => {}; // 由 initServiceWorker() 接手
@@ -694,6 +695,7 @@
     $('cloudOpTap').hidden = true;
     $('cloudOpCancel').hidden = false; $('cloudOpCancel').disabled = false; $('cloudOpCancel').textContent = '取消';
     setCloudButtons(true);
+    acquireWakeLock('下載');
     return ctrl;
   }
   function opSet(msg, pct) {
@@ -706,6 +708,7 @@
     $('cloudOpProgress').hidden = true; $('cloudOpTap').hidden = true;
     $('cloudOpCancel').hidden = false; $('cloudOpCancel').disabled = false; $('cloudOpCancel').textContent = '關閉';
     setCloudButtons(false);
+    if (!uploading) releaseWakeLock();
   }
   function opCancel() {
     if (!cloudOp) { $('cloudOp').hidden = true; return; }
@@ -767,6 +770,104 @@
     setTimeout(() => URL.revokeObjectURL(url), 120000); // iOS 需要時間讀取，晚一點才釋放
   }
 
+  // ----- 下載診斷：失敗時要說得出「卡在哪一步」 -----
+  // 單檔串流下載有三個環節：① 向 Google 要檔案 → ② 從 Google 持續接收 → ③ 交給系統下載（頁面 → SW → Safari）。
+  // Safari 的 fetch 在任何網路層失敗時都只回報「Load failed」，所以每個環節自己貼上 stage 標籤。
+  function makeDiag(name, size) {
+    const t0 = Date.now(), ev = [];
+    const d = {
+      name, size, read: 0, sent: 0, resumes: 0, hidden: 0, mode: 'stream',
+      ev, secs: () => Math.round((Date.now() - t0) / 1000),
+      log(what) { ev.push(`${((Date.now() - t0) / 1000).toFixed(1)}s ${what}`); if (ev.length > 40) ev.splice(1, 1); console.log('[下載診斷]', what); }
+    };
+    d.log(`開始：${name}（${size ? humanSize(size) : '大小未知'}）`);
+    return d;
+  }
+  function stageError(stage, message) { const e = new Error(message); e.stage = stage; return e; }
+  const STAGE_HEAD = {
+    'google-open': '第 1 步：向 Google 要檔案（還沒開始傳送）',
+    'google-read': '第 2 步：從 Google 接收資料時中斷（已自動續傳仍失敗）',
+    'handoff': '第 3 步：交給系統下載（Safari 沒有接手）',
+    'sw-stall': '第 3 步：系統下載停止索取資料',
+    'sw-cancel': '第 3 步：系統端取消或停止了下載'
+  };
+  const STAGE_TIP = {
+    'google-open': '請確認網路與 Google 授權（可到「備份資料」分頁重新授權）後再試。',
+    'google-read': '最常見的原因是下載途中螢幕鎖定或切到別的 App：iOS 會凍結網頁並切斷連線。請保持螢幕亮起、停留在本頁，再試一次。',
+    'handoff': 'Safari 沒有開始接手下載。請重新整理本頁後再試；仍失敗的話，改用「相簿」按鈕。',
+    'sw-stall': '請重新整理本頁後再試（iOS 回收背景程序後，下載通道會重建）。',
+    'sw-cancel': '若不是你在 iOS 下載清單按的取消，代表 Safari 中斷了它。請到下載清單刪除未完成的檔案，再重新下載。'
+  };
+  function explainFailure(err, d) {
+    const stage = err.stage || (d.mode === 'blob' ? 'google-read' : 'handoff');
+    const lines = [
+      `下載失敗：${STAGE_HEAD[stage] || '未知環節'}`,
+      `原因：${err.message}`,
+      `進度：從 Google 收到 ${humanSize(d.read)}${d.size ? ' / ' + humanSize(d.size) : ''}；交給系統 ${humanSize(d.sent)}；耗時 ${d.secs()} 秒；自動續傳 ${d.resumes} 次；離開畫面 ${d.hidden} 次。`
+    ];
+    if (d.hidden > 0) lines.push('⚠️ 下載期間曾離開畫面，這很可能就是中斷原因。');
+    if (STAGE_TIP[stage]) lines.push(STAGE_TIP[stage]);
+    lines.push('診斷紀錄：', ...d.ev.slice(-8));
+    return lines.join('\n');
+  }
+
+  // ----- 可續傳的 Drive 讀取串流 -----
+  // 讀取中途斷線（Safari 的「Load failed」）時，以 Range 從已收到的位元組接著抓，上層完全不會察覺；
+  // 連續失敗太多次才放棄。只在「讀取」環節使用，highWaterMark 0：上層要才讀，不預先抓。
+  const RESUME_MAX_CONSECUTIVE = 5, RESUME_MAX_TOTAL = 40;
+  function isResumableError(err) {
+    if (err && typeof err.status === 'number') return err.status === 408 || err.status === 429 || err.status >= 500;
+    return !(err && err.fatal); // 沒有狀態碼：多半是網路錯誤（TypeError: Load failed）或資料提前結束
+  }
+  function waitOnline(ms) {
+    return new Promise(res => {
+      if (navigator.onLine !== false) return res();
+      const done = () => { clearTimeout(t); window.removeEventListener('online', done); res(); };
+      const t = setTimeout(done, ms);
+      window.addEventListener('online', done);
+    });
+  }
+  function resumableDriveStream(file, firstRes, size, ctrl, diag) {
+    let offset = 0, reader = firstRes.body.getReader(), consecutive = 0;
+    const url = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}?alt=media`;
+    async function reopen() {
+      const res = await authFetch(url, { signal: ctrl.ac.signal, headers: { Range: `bytes=${offset}-` } });
+      if (res.status !== 206) { const e = new Error(`續傳失敗（HTTP ${res.status}）`); e.status = res.status; throw e; }
+      const m = /bytes\s+(\d+)-/.exec(res.headers.get('Content-Range') || '');
+      if (m && Number(m[1]) !== offset) { const e = new Error('續傳起點不符'); e.fatal = true; throw e; }
+      return res.body.getReader();
+    }
+    return new ReadableStream({
+      async pull(controller) {
+        for (;;) {
+          if (ctrl.aborted) throw cancelledError();
+          try {
+            if (!reader) { await waitOnline(120000); reader = await reopen(); diag.log(`續傳連線成功，從 ${humanSize(offset)} 接續`); }
+            const r = await reader.read();
+            if (r.done) {
+              if (size && offset < size) throw new Error(`資料提前結束（${offset} / ${size} bytes）`);
+              controller.close(); return;
+            }
+            offset += r.value.byteLength; diag.read = offset; consecutive = 0;
+            controller.enqueue(r.value);
+            return;
+          } catch (err) {
+            if (ctrl.aborted) throw cancelledError();
+            if (reader) { try { reader.cancel().catch(() => {}); } catch (e) { /* 忽略 */ } }
+            reader = null; consecutive++; diag.resumes++;
+            diag.log(`Google 讀取中斷於 ${humanSize(offset)}：${err.message}`);
+            if (!isResumableError(err) || consecutive > RESUME_MAX_CONSECUTIVE || diag.resumes > RESUME_MAX_TOTAL) {
+              if (!err.stage) err.stage = 'google-read';
+              throw err;
+            }
+            await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** (consecutive - 1), 8000))); // 1、2、4、8、8 秒
+          }
+        }
+      },
+      cancel(reason) { if (reader) reader.cancel(reason).catch(() => {}); }
+    }, { highWaterMark: 0 });
+  }
+
   // ----- 串流存檔（頁面 → Service Worker → 瀏覽器下載） -----
   async function canStreamSave() {
     if (!('serviceWorker' in navigator) || !navigator.serviceWorker.controller || typeof ReadableStream === 'undefined' || typeof MessageChannel === 'undefined') return false;
@@ -780,17 +881,25 @@
   }
 
   // source：ReadableStream<Uint8Array>。SW 每次要資料才通知（pull），所以瀏覽器寫入慢，這邊讀取也會跟著慢。
-  function streamSave(filename, source, { size = null, ctrl = null, onProgress = null } = {}) {
+  const PULL_WATCHDOG_MS = 6 * 60 * 1000; // 比 SW 自己的 5 分鐘逾時多一點：SW 若已被 iOS 終止，頁面也不會永遠等下去
+  function streamSave(filename, source, { size = null, ctrl = null, onProgress = null, diag = null } = {}) {
     return new Promise((resolve, reject) => {
       const id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
       const ch = new MessageChannel();
       const reader = (source || new Blob([]).stream()).getReader();
-      let sent = 0, srcDone = false, settled = false, pumping = false;
+      let sent = 0, srcDone = false, settled = false, pumping = false, lastPull = Date.now(), loggedAt = 0, pulled = false;
+      const log = m => { if (diag) diag.log(m); };
 
-      const startTimer = setTimeout(() => fail(new Error('串流下載沒有啟動（瀏覽器沒有接手下載）')), 15000);
-      const cleanup = () => { settled = true; clearTimeout(startTimer); try { ch.port1.close(); } catch (e) { /* 忽略 */ } };
+      const startTimer = setTimeout(() => fail(stageError('handoff', '串流下載沒有啟動（瀏覽器沒有接手下載）')), 15000);
+      const watchdog = setInterval(() => {
+        if (!settled && !pumping && Date.now() - lastPull > PULL_WATCHDOG_MS) {
+          fail(stageError('sw-stall', `系統下載已超過 ${Math.round(PULL_WATCHDOG_MS / 60000)} 分鐘沒有索取資料（Service Worker 可能已被 iOS 終止）`));
+        }
+      }, 5000);
+      const cleanup = () => { settled = true; clearTimeout(startTimer); clearInterval(watchdog); try { ch.port1.close(); } catch (e) { /* 忽略 */ } };
       const fail = err => {
         if (settled) return;
+        if (diag) { diag.sent = sent; diag.log(`中止：${err.message}`); }
         try { ch.port1.postMessage({ type: 'error', message: err.message }); } catch (e) { /* 忽略 */ }
         cleanup(); reader.cancel(err).catch(() => {}); reject(err);
       };
@@ -802,7 +911,8 @@
         try {
           const parts = []; let n = 0;
           while (n < FLUSH_BYTES) {
-            const r = await reader.read();
+            let r;
+            try { r = await reader.read(); } catch (e) { if (!e.stage) e.stage = 'google-read'; throw e; }
             if (r.done) { srcDone = true; break; }
             parts.push(r.value); n += r.value.byteLength;
           }
@@ -812,9 +922,10 @@
             for (const p of parts) { buf.set(p, o); o += p.byteLength; }
             sent += n;
             ch.port1.postMessage({ type: 'chunk', data: buf.buffer }, [buf.buffer]);
+            if (diag) { diag.sent = sent; if (sent - loggedAt >= 32 * 1024 * 1024) { loggedAt = sent; diag.log(`已交給系統 ${humanSize(sent)}`); } }
             if (onProgress) onProgress(sent);
           }
-          if (srcDone) { ch.port1.postMessage({ type: 'end' }); cleanup(); resolve(sent); }
+          if (srcDone) { ch.port1.postMessage({ type: 'end' }); cleanup(); log(`資料全部送出（${humanSize(sent)}）`); resolve(sent); }
         } catch (err) { fail(ctrl && ctrl.aborted ? cancelledError() : err); }
         finally { pumping = false; }
       }
@@ -826,13 +937,18 @@
           a.href = new URL(`./__dl/${id}/${encodeURIComponent(filename)}`, location.href).href;
           a.hidden = true; // 不加 download 屬性：Chromium 會讓帶 download 的連結繞過 Service Worker；檔名由 Content-Disposition 決定
           document.body.appendChild(a); a.click(); a.remove();
-        } else if (m.type === 'pull') { clearTimeout(startTimer); pump(); }
-        else if (m.type === 'cancel') fail(cancelledError());  // 使用者在 iOS 下載清單取消
-        else if (m.type === 'expired') fail(new Error('下載連結逾時'));
+          log('已通知瀏覽器開始下載');
+        } else if (m.type === 'pull') {
+          lastPull = Date.now();
+          if (!pulled) { pulled = true; log('系統開始索取資料'); }
+          clearTimeout(startTimer); pump();
+        }
+        else if (m.type === 'cancel') fail(ctrl && ctrl.aborted ? cancelledError() : stageError('sw-cancel', '系統端取消或停止了下載'));
+        else if (m.type === 'expired') fail(stageError('handoff', '下載連結逾時（30 秒內瀏覽器沒有取用）'));
       };
       try {
         navigator.serviceWorker.controller.postMessage({ action: 'dl-start', id, filename, size }, [ch.port2]);
-      } catch (e) { fail(e); }
+      } catch (e) { fail(stageError('handoff', e.message)); }
     });
   }
 
@@ -841,21 +957,31 @@
     if (cloudOp) return;
     const size = Number(file.size) || 0;
     const ctrl = opStart(`準備下載：${file.name}`);
+    const diag = makeDiag(file.name, size); dlDiag = diag;
     try {
       if (await canStreamSave()) {
-        const res = await openDriveFile(file.id, ctrl);
-        await streamSave(file.name, res.body, {
-          size: size || null, ctrl,
-          onProgress: n => opSet(`傳送中：${file.name}\n${humanSize(n)} / ${humanSize(size)}`, size ? n / size * 100 : null)
+        diag.log('串流通道可用');
+        let res;
+        try { res = await openDriveFile(file.id, ctrl); }
+        catch (e) { if (!e.cancelled && !e.stage) e.stage = 'google-open'; throw e; }
+        diag.log(`Google 回應 HTTP ${res.status}，Content-Length ${res.headers.get('Content-Length') || '未提供'}`);
+        const source = resumableDriveStream(file, res, size, ctrl, diag);
+        await streamSave(file.name, source, {
+          size: size || null, ctrl, diag,
+          onProgress: n => opSet(`傳送中：${file.name}\n${humanSize(n)} / ${humanSize(size)}` + (diag.resumes ? `\n（網路中斷後已自動續傳 ${diag.resumes} 次）` : ''), size ? n / size * 100 : null)
         });
         opEnd(`已交給系統下載：${file.name}。請在 iOS 的下載清單，或「檔案」App 的「下載項目」查看。`, 'success');
       } else {
+        diag.mode = 'blob';
         if (size > BLOB_LIMIT && !confirm(`這個檔案 ${humanSize(size)}，目前無法使用串流下載，必須先整個放進記憶體，iOS 可能會因此重新整理頁面。\n\n建議：重新開啟 App 更新到最新版後再試，或改用「相簿」。\n\n仍要繼續嗎？`)) throw cancelledError();
-        const blob = await fetchAsBlob(file, ctrl, n => opSet(`下載中：${file.name}\n${humanSize(n)} / ${humanSize(size)}`, size ? n / size * 100 : null));
+        const blob = await fetchAsBlob(file, ctrl, n => { diag.read = n; opSet(`下載中：${file.name}\n${humanSize(n)} / ${humanSize(size)}`, size ? n / size * 100 : null); });
         anchorDownload(blob, file.name);
         opEnd(`已觸發下載：${file.name}`, 'success');
       }
-    } catch (err) { opEnd(err.cancelled ? '已取消。' : `下載失敗：${err.message}`, err.cancelled ? '' : 'error'); }
+    } catch (err) {
+      diag.log(err.cancelled ? '使用者取消' : `失敗：${err.message}`);
+      opEnd(err.cancelled ? '已取消。' : explainFailure(err, diag), err.cancelled ? '' : 'error');
+    } finally { dlDiag = null; }
   }
 
   // ----- 批次：決定要處理哪些檔案 -----
@@ -1134,21 +1260,28 @@
   }
 
   // ===== 螢幕喚醒保持 =====
+  // 備份與雲端下載都要花好幾分鐘。iOS 自動鎖定螢幕時會凍結網頁、切斷進行中的連線（Safari 只會回報「Load failed」），
+  // 所以兩者都要保持螢幕亮起；任何一個還在進行，就不釋放。
+  function wakeWanted() { return uploading || !!cloudOp; }
   function setWakeNote(msg, warn = false) {
-    const n = $('wakeNote'); if (!n) return;
-    n.textContent = msg; n.className = 'hint' + (warn ? ' warn-text' : '');
+    for (const id of ['wakeNote', 'cloudWakeNote']) {
+      const n = $(id); if (!n) continue;
+      n.textContent = msg; n.className = 'hint' + (warn ? ' warn-text' : '');
+    }
   }
-  async function acquireWakeLock() {
-    if (wakeLock && !wakeLock.released) return;
-    if (!('wakeLock' in navigator)) { setWakeNote('⚠️ 這個瀏覽器不支援螢幕常亮，備份期間請手動保持螢幕亮起。', true); return; }
+  async function acquireWakeLock(what = '備份') {
+    if (wakeLock && !wakeLock.released) return true;
+    if (!('wakeLock' in navigator)) { setWakeNote(`⚠️ 這個瀏覽器不支援螢幕常亮，${what}期間請手動保持螢幕亮起。`, true); return false; }
     try {
       const lock = await navigator.wakeLock.request('screen');
-      if (!uploading) { try { await lock.release(); } catch (e) { /* 忽略 */ } return; } // 等待期間備份已結束
+      if (!wakeWanted()) { try { await lock.release(); } catch (e) { /* 忽略 */ } return false; } // 等待期間工作已結束
       wakeLock = lock;
-      setWakeNote('🔆 備份期間會保持螢幕亮起。');
+      setWakeNote(`🔆 ${what}期間會保持螢幕亮起。`);
+      return true;
     } catch (e) {
       wakeLock = null;
-      setWakeNote(`⚠️ 無法啟用螢幕常亮（${e.name || '未知原因'}），備份期間請手動保持螢幕亮起。`, true);
+      setWakeNote(`⚠️ 無法啟用螢幕常亮（${e.name || '未知原因'}），${what}期間請手動保持螢幕亮起。`, true);
+      return false;
     }
   }
   async function releaseWakeLock() {
@@ -1158,10 +1291,14 @@
   }
   // 頁面被切到背景時系統會自動釋放喚醒鎖；回到前景要重新要求
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') { if (uploading) hiddenDuringUpload = true; return; }
-    if (uploading) acquireWakeLock();
+    const hidden = document.visibilityState === 'hidden';
+    if (dlDiag) { dlDiag.log(hidden ? '畫面離開（切到背景或螢幕鎖定）' : '畫面回到前景'); if (hidden) dlDiag.hidden++; }
+    if (hidden) { if (uploading) hiddenDuringUpload = true; return; }
+    if (wakeWanted()) acquireWakeLock(cloudOp && !uploading ? '下載' : '備份');
     if (swReg) swReg.update().catch(() => {});
   });
+  window.addEventListener('online', () => { if (dlDiag) dlDiag.log('網路恢復'); });
+  window.addEventListener('offline', () => { if (dlDiag) dlDiag.log('網路中斷'); });
 
   // ===== 上傳前檢查雲端剩餘空間 =====
   // 回傳 { proceed }。取不到容量資訊時不擋（只記 console）；空間不足時交給使用者決定，
@@ -1881,10 +2018,10 @@
       $('cancelBackup').hidden = false; $('cancelBackup').disabled = false; $('cancelBackup').textContent = '取消備份';
       $('retryFailed').hidden = true;
       $('backup').disabled = true; $('progress').hidden = false; $('progress').value = 0;
-      acquireWakeLock();
+      acquireWakeLock('備份');
     } else {
       $('cancelBackup').hidden = true;
-      releaseWakeLock();
+      if (!cloudOp) releaseWakeLock();
       $('retryFailed').hidden = failedJobs.length === 0;
       $('retryFailed').textContent = `只重試失敗／未完成的檔案（${failedJobs.length}）`;
     }
