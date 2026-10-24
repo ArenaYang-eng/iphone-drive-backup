@@ -1,5 +1,5 @@
 (() => {
-  const APP_VERSION = 'v4.2';
+  const APP_VERSION = 'v4.3';
   const $ = id => document.getElementById(id);
   
   const verEl = $('versionDisplay');
@@ -132,6 +132,15 @@
     if (r.scope) grantedScopes = new Set(r.scope.split(' ').filter(Boolean));
     connectedOnce = true;
     $('connection').textContent = '已連線'; $('connection').className = 'pill ok';
+    
+    // 【新增】把 Token 暫存到本機，避免 PWA 重開後遺失
+    try {
+      localStorage.setItem('iphoneBackupAuth', JSON.stringify({
+        token: accessToken,
+        expire: tokenExpiresAt,
+        scopes: Array.from(grantedScopes)
+      }));
+    } catch (e) { /* 忽略 */ }
   }
 
   // overrides 可帶 { prompt, scope, include_granted_scopes }；需在使用者點擊（手勢）中呼叫，iOS 才不會擋彈窗
@@ -531,25 +540,20 @@
   }
 
   // ===== 雲端還原：清單（分頁）、單檔下載、ZIP 串流、存到相簿 =====
-  // iOS 的限制與對策：
-  //  - 大影片整個放進記憶體（blob）容易讓頁面崩潰 → 有 Service Worker 時改用「串流下載」，資料只經過小段緩衝。
-  //  - 連續觸發數百次下載會被攔截 → 整批改成「單一 ZIP 串流」；沒有 SW 時改成「分批 ZIP」，每份點一下。
-  //  - 要存進「照片」→ 用 navigator.share({files}) 開啟分享表單；它必須由「點擊」直接觸發，所以先準備好、再請使用者點按鈕。
   const FOLDER_MIME = 'application/vnd.google-apps.folder';
   const CLOUD_PAGE = 100;
-  const BLOB_LIMIT = 150 * 1024 * 1024;          // 沒有串流可用時，單檔放進記憶體的上限（超過要使用者確認）
+  const BLOB_LIMIT = 150 * 1024 * 1024;
   const SHARE_BATCH_FILES = 20;
   const SHARE_BATCH_BYTES = 150 * 1024 * 1024;
   const SHARE_BIG_FILE = 300 * 1024 * 1024;
   const ZIP_PART_BYTES = 200 * 1024 * 1024;
-  const FLUSH_BYTES = 512 * 1024;                // 串流時，累積到這麼大才傳一次給 SW，減少訊息數
+  const FLUSH_BYTES = 512 * 1024;
   let cloudFolderId = null, cloudNextToken = null, cloudSeq = 0, cloudOp = null;
-  const cloudLoaded = new Map();                 // id → 已載入清單中的檔案
-  const cloudSelected = new Set();               // 已勾選的檔案 id
+  const cloudLoaded = new Map();
+  const cloudSelected = new Set();
 
   const isMediaMime = m => /^(image|video)\//.test(m || '');
   const cancelledError = () => { const e = new Error('已取消'); e.cancelled = true; return e; };
-  // 檔名／路徑片段：拿掉會讓 ZIP 或檔案系統出問題的字元
   const safeSeg = s => { const t = String(s ?? '').replace(/[\u0000-\u001f\u007f\\/:*?"<>|]/g, '_').trim(); return (!t || t === '.' || t === '..') ? '_' : t; };
   function uniquePaths(list) {
     const seen = new Set();
@@ -591,7 +595,6 @@
       back.addEventListener('click', () => { const prev = folderHistory[folderHistory.length - 2]; loadCloudFiles(prev.id, prev.name); });
       nodes.push(back, el('br'));
     }
-    // 資料夾名稱來自雲端，一律以純文字顯示
     nodes.push(el('span', { class: 'crumb-path', text: '📍 目前位置：' + folderHistory.map(f => f.name).join(' / ') }));
     crumbEl.replaceChildren(...nodes);
   }
@@ -630,7 +633,6 @@
     return li;
   }
 
-  // 讀一頁（100 筆）。first=true 是進入資料夾的第一頁；之後由「載入更多」用 nextPageToken 接續。
   async function loadCloudPage(seq, first) {
     const query = `'${cloudFolderId}' in parents and trashed = false`;
     const url = 'https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(query) +
@@ -638,7 +640,7 @@
       `&pageSize=${CLOUD_PAGE}&orderBy=folder,createdTime desc` +
       (cloudNextToken ? '&pageToken=' + encodeURIComponent(cloudNextToken) : '');
     const res = await apiRequest(url);
-    if (seq !== cloudSeq) return; // 期間已切換資料夾，捨棄這份結果
+    if (seq !== cloudSeq) return;
     cloudNextToken = res.nextPageToken || null;
     const files = res.files || [];
     if (first && !files.length) { setCloudList(el('li', { text: '此資料夾內尚無檔案。' })); $('cloudMore').hidden = true; $('batchActionBar').hidden = true; return; }
@@ -685,7 +687,7 @@
     }
   }
 
-  // ----- 操作面板（進度、取消、需要使用者點擊的步驟） -----
+  // ----- 操作面板 -----
   function opStart(msg) {
     const ctrl = { aborted: false, ac: new AbortController(), rejectTap: null };
     cloudOp = ctrl;
@@ -717,7 +719,6 @@
     if (cloudOp.rejectTap) cloudOp.rejectTap(cancelledError());
     $('cloudOpCancel').disabled = true; $('cloudOpMsg').textContent = '正在取消…';
   }
-  // 等使用者點按鈕；action 會在「點擊事件裡同步開始執行」，navigator.share 才不會被 iOS 擋下。
   function opTap(ctrl, msg, label, action) {
     return new Promise((resolve, reject) => {
       const btn = $('cloudOpTap');
@@ -733,7 +734,6 @@
       btn.addEventListener('click', onTap);
     });
   }
-  // 備份頁以外的分頁遇到授權過期時，提醒使用者去哪裡處理
   function notifyReauthNeeded() {
     if (cloudOp) opSet('⚠️ Google 授權已過期。請切到「備份資料」分頁，按「重新授權並繼續」，下載會自動接續。');
   }
@@ -747,7 +747,6 @@
     return res;
   }
 
-  // 整個讀進記憶體（只用於：沒有串流可用的小檔案、以及要交給分享表單的檔案）
   async function fetchAsBlob(file, ctrl, onBytes) {
     const res = await openDriveFile(file.id, ctrl);
     if (!res.body) return await res.blob();
@@ -763,32 +762,43 @@
     return new Blob(chunks, { type: file.mimeType || 'application/octet-stream' });
   }
 
-  function anchorDownload(blob, name) {
+  // 【修改】支援透過 iOS 原生分享面板儲存，避開 PWA 下載預覽卡死的問題
+  async function anchorDownload(blob, name) {
+    const file = new File([blob], name, { type: blob.type || 'application/octet-stream' });
+    
+    // 優先使用分享面板（PWA 或 iOS 支援時）
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: name });
+        return 'shared';
+      } catch (e) {
+        if (e.name === 'AbortError') return 'aborted';
+        console.warn('分享失敗，退回傳統下載', e);
+      }
+    }
+
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = name; a.hidden = true;
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 120000); // iOS 需要時間讀取，晚一點才釋放
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+    return 'downloaded';
   }
 
-  // iOS 主畫面 App（standalone）的系統限制：下載完成後，iOS 會用「檔案預覽」整個蓋住 App，而且沒有返回鍵
-  // （WebKit 已知問題，網頁無法控制）。Safari 分頁沒有這個問題。所以在主畫面 App 下載時，事先把出路說清楚。
   function isStandalone() {
     return window.navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
   }
   const IOS_PREVIEW_NOTE =
     '⚠️ 主畫面 App 的限制：下載完成後，iOS 會跳出檔案預覽，而且沒有返回鍵。\n' +
     '・影片／照片：點「更多…」→「儲存影片／儲存影像」就會存入相簿。\n' +
-    '・要回到本頁：先從螢幕左邊緣往右滑；沒反應就從螢幕底部上滑、把本 App 往上滑掉，再從主畫面重新開啟（重開後要再按一次「連線 Google」）。\n' +
-    '・想避開這個預覽畫面：改用 Safari 分頁開啟本網址下載，檔案會進「檔案」App 的「下載項目」，頁面不會被蓋住。';
+    '・要回到本頁：先從螢幕左邊緣往右滑；沒反應就從螢幕底部上滑、把本 App 往上滑掉，再從主畫面重新開啟（重開後會自動接續授權）。\n' +
+    '・想避開這個預覽畫面：單一檔案建議改用「相簿」按鈕，或改用 Safari 分頁開啟本網址下載。';
   function showIosNote(show) {
     const n = $('cloudIosNote'); if (!n) return;
     n.textContent = show ? IOS_PREVIEW_NOTE : ''; n.hidden = !show;
   }
 
-  // ----- 下載診斷：失敗時要說得出「卡在哪一步」 -----
-  // 單檔串流下載有三個環節：① 向 Google 要檔案 → ② 從 Google 持續接收 → ③ 交給系統下載（頁面 → SW → Safari）。
-  // Safari 的 fetch 在任何網路層失敗時都只回報「Load failed」，所以每個環節自己貼上 stage 標籤。
+  // ----- 下載診斷 -----
   function makeDiag(name, size) {
     const t0 = Date.now(), ev = [];
     const d = {
@@ -828,12 +838,10 @@
   }
 
   // ----- 可續傳的 Drive 讀取串流 -----
-  // 讀取中途斷線（Safari 的「Load failed」）時，以 Range 從已收到的位元組接著抓，上層完全不會察覺；
-  // 連續失敗太多次才放棄。只在「讀取」環節使用，highWaterMark 0：上層要才讀，不預先抓。
   const RESUME_MAX_CONSECUTIVE = 5, RESUME_MAX_TOTAL = 40;
   function isResumableError(err) {
     if (err && typeof err.status === 'number') return err.status === 408 || err.status === 429 || err.status >= 500;
-    return !(err && err.fatal); // 沒有狀態碼：多半是網路錯誤（TypeError: Load failed）或資料提前結束
+    return !(err && err.fatal);
   }
   function waitOnline(ms) {
     return new Promise(res => {
@@ -876,7 +884,7 @@
               if (!err.stage) err.stage = 'google-read';
               throw err;
             }
-            await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** (consecutive - 1), 8000))); // 1、2、4、8、8 秒
+            await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** (consecutive - 1), 8000)));
           }
         }
       },
@@ -884,20 +892,19 @@
     }, { highWaterMark: 0 });
   }
 
-  // ----- 串流存檔（頁面 → Service Worker → 瀏覽器下載） -----
+  // ----- 串流存檔 -----
   async function canStreamSave() {
     if (!('serviceWorker' in navigator) || !navigator.serviceWorker.controller || typeof ReadableStream === 'undefined' || typeof MessageChannel === 'undefined') return false;
     return new Promise(resolve => {
       const ch = new MessageChannel();
-      const t = setTimeout(() => resolve(false), 1500); // 舊版 SW 不認得這個指令：逾時就當作不支援
+      const t = setTimeout(() => resolve(false), 1500);
       ch.port1.onmessage = e => { clearTimeout(t); resolve(!!(e.data && e.data.type === 'ready')); };
       try { navigator.serviceWorker.controller.postMessage({ action: 'dl-probe' }, [ch.port2]); }
       catch (e) { clearTimeout(t); resolve(false); }
     });
   }
 
-  // source：ReadableStream<Uint8Array>。SW 每次要資料才通知（pull），所以瀏覽器寫入慢，這邊讀取也會跟著慢。
-  const PULL_WATCHDOG_MS = 6 * 60 * 1000; // 比 SW 自己的 5 分鐘逾時多一點：SW 若已被 iOS 終止，頁面也不會永遠等下去
+  const PULL_WATCHDOG_MS = 6 * 60 * 1000;
   function streamSave(filename, source, { size = null, ctrl = null, onProgress = null, diag = null } = {}) {
     return new Promise((resolve, reject) => {
       const id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
@@ -949,10 +956,10 @@
 
       ch.port1.onmessage = e => {
         const m = e.data || {};
-        if (m.type === 'ready') { // SW 已登記這個下載 → 觸發瀏覽器去取
+        if (m.type === 'ready') {
           const a = document.createElement('a');
           a.href = new URL(`./__dl/${id}/${encodeURIComponent(filename)}`, location.href).href;
-          a.hidden = true; // 不加 download 屬性：Chromium 會讓帶 download 的連結繞過 Service Worker；檔名由 Content-Disposition 決定
+          a.hidden = true;
           document.body.appendChild(a); a.click(); a.remove();
           log('已通知瀏覽器開始下載');
         } else if (m.type === 'pull') {
@@ -976,8 +983,20 @@
     const ctrl = opStart(`準備下載：${file.name}`);
     const diag = makeDiag(file.name, size); dlDiag = diag;
     try {
-      if (await canStreamSave()) {
-        diag.log('串流通道可用');
+      // 【新增】PWA 模式且支援分享時，改用 Blob + 分享面板，避開預覽卡死
+      const useBlobShare = isStandalone() && navigator.canShare && size < 800 * 1024 * 1024;
+
+      if (useBlobShare) {
+        diag.mode = 'blob-share';
+        const blob = await fetchAsBlob(file, ctrl, n => { diag.read = n; opSet(`下載中：${file.name}\n${humanSize(n)} / ${humanSize(size)}`, size ? n / size * 100 : null); });
+        const res = await anchorDownload(blob, file.name);
+        if (res === 'aborted') throw cancelledError();
+        opEnd(`已觸發儲存：${file.name}。請在跳出的選單選擇「儲存到檔案」或「儲存影像」。`, 'success');
+      } else if (await canStreamSave()) {
+        diag.mode = 'stream';
+        if (isStandalone() && size > 800 * 1024 * 1024) {
+          if (!confirm(`這個檔案約 ${humanSize(size)}，較大。\n在 iOS 主畫面模式下，下載完成後可能會卡在預覽頁無法返回。\n\n建議改用「相簿」按鈕存到照片，或把網址複製到 Safari 分頁中下載。\n\n仍要繼續嗎？`)) throw cancelledError();
+        }
         let res;
         try { res = await openDriveFile(file.id, ctrl); }
         catch (e) { if (!e.cancelled && !e.stage) e.stage = 'google-open'; throw e; }
@@ -987,12 +1006,12 @@
           size: size || null, ctrl, diag,
           onProgress: n => opSet(`傳送中：${file.name}\n${humanSize(n)} / ${humanSize(size)}` + (diag.resumes ? `\n（網路中斷後已自動續傳 ${diag.resumes} 次）` : ''), size ? n / size * 100 : null)
         });
-        opEnd(`已交給系統下載：${file.name}。請在 iOS 的下載清單，或「檔案」App 的「下載項目」查看。`, 'success');
+        opEnd(`已交給系統下載：${file.name}。`, 'success');
       } else {
         diag.mode = 'blob';
-        if (size > BLOB_LIMIT && !confirm(`這個檔案 ${humanSize(size)}，目前無法使用串流下載，必須先整個放進記憶體，iOS 可能會因此重新整理頁面。\n\n建議：重新開啟 App 更新到最新版後再試，或改用「相簿」。\n\n仍要繼續嗎？`)) throw cancelledError();
         const blob = await fetchAsBlob(file, ctrl, n => { diag.read = n; opSet(`下載中：${file.name}\n${humanSize(n)} / ${humanSize(size)}`, size ? n / size * 100 : null); });
-        anchorDownload(blob, file.name);
+        const res = await anchorDownload(blob, file.name);
+        if (res === 'aborted') throw cancelledError();
         opEnd(`已觸發下載：${file.name}`, 'success');
       }
     } catch (err) {
@@ -1038,7 +1057,6 @@
   }
 
   // ----- ZIP -----
-  // 產生 ZIP 的項目：一次只打開一個 Drive 檔案；打不開的檔案略過，結尾附上「_下載失敗清單.txt」
   function makeZipEntries(files, ctrl, failures, state, appendFailureList) {
     return (async function* () {
       for (const f of files) {
@@ -1071,7 +1089,6 @@
       (failures.length ? `\n有 ${failures.length} 個檔案沒能放進去，詳見 ZIP 內的「_下載失敗清單.txt」。` : ''), failures.length ? 'error' : 'success');
   }
 
-  // 沒有串流可用時：把檔案分成幾份（每份約 200MB），一份一份做成 ZIP，每份由使用者點一下下載
   async function zipInParts(entries, total, zipName, ctrl) {
     const parts = []; let cur = [], curBytes = 0;
     for (const f of entries) {
@@ -1108,8 +1125,17 @@
       if (!entries.length) throw new Error('沒有可下載的檔案。');
       const total = entries.reduce((s, f) => s + (Number(f.size) || 0), 0);
       const streaming = await canStreamSave();
-      if (!confirm(`即將打包 ${entries.length} 個檔案，約 ${humanSize(total)}。\n\n` +
-        (streaming ? '會以單一 ZIP 串流下載，不會佔用大量記憶體。' : '目前無法使用串流下載，會分成約 200 MB 一份，每份需要你點一下按鈕。') + '\n\n要開始嗎？')) throw cancelledError();
+      
+      let msg = `即將打包 ${entries.length} 個檔案，約 ${humanSize(total)}。\n\n` +
+        (streaming ? '會以單一 ZIP 串流下載，不會佔用大量記憶體。' : '目前無法使用串流下載，會分成約 200 MB 一份，每份需要你點一下按鈕。');
+      
+      // 【新增】PWA 模式警告
+      if (isStandalone()) {
+        msg += `\n\n⚠️ 注意：在主畫面 App 模式下，iOS 下載後可能會跳出預覽頁且沒有返回鍵。\n若卡住，請從底部上滑關閉 App 重開（Token 會自動記住）。\n若要避免此問題，建議改用上方「存到相簿」，或把網址複製到 Safari 操作。`;
+      }
+      
+      if (!confirm(msg + '\n\n要開始嗎？')) throw cancelledError();
+      
       const zipName = `${safeSeg(currentFolderName())}_${stampTag()}.zip`;
       if (streaming) await zipStreaming(entries, total, zipName, ctrl);
       else await zipInParts(entries, total, zipName, ctrl);
@@ -1155,7 +1181,7 @@
             `📲 開啟分享表單（${b + 1}/${batches.length}）`, () => navigator.share({ files: shareFiles }));
           opened++;
         } catch (e) {
-          if (e && e.name === 'AbortError') dismissed++;  // 使用者關閉了分享表單：視為略過這一批，繼續下一批
+          if (e && e.name === 'AbortError') dismissed++;
           else throw e;
         }
       }
@@ -1168,7 +1194,7 @@
   if ($('docPicker')) $('docPicker').addEventListener('change', e => addFiles(e.target.files));
   if ($('vcfPicker')) $('vcfPicker').addEventListener('change', async e => { const fl = Array.from(e.target.files); e.target.value = ''; await addPimFiles(fl, 'vcf'); });
   if ($('icsPicker')) $('icsPicker').addEventListener('change', async e => { const fl = Array.from(e.target.files); e.target.value = ''; await addPimFiles(fl, 'ics'); });
-  // 勾選匯出的當下才請求唯讀授權（漸進授權）；這次點擊本身就是 iOS 要求的使用者手勢
+  
   async function onExportToggle(e, scope, label) {
     const box = e.target;
     if (box.checked && !hasScope(scope)) {
@@ -1241,6 +1267,7 @@
       if (uploading) { showResult('備份進行中，請先按「取消備份」，再清除連線狀態。', 'error'); return; }
       if (accessToken && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(accessToken, () => {});
       accessToken = null; tokenExpiresAt = 0; connectedOnce = false; grantedScopes = new Set(); resetDriveCaches();
+      try { localStorage.removeItem('iphoneBackupAuth'); } catch(e) {} // 【新增】清除暫存
       if ($('reauthBox')) $('reauthBox').hidden = true;
       $('connection').textContent = '尚未連線'; $('connection').className = 'pill warn';
       cloudSeq++;
@@ -1260,7 +1287,6 @@
   });
 
   // ===== 小工具 =====
-  // 以 DOM 方法建立元素；字串子節點一律當純文字，不會被解析成 HTML（雲端檔名、錯誤訊息都不可信）
   function el(tag, attrs, ...children) {
     const n = document.createElement(tag);
     if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -1277,8 +1303,6 @@
   }
 
   // ===== 螢幕喚醒保持 =====
-  // 備份與雲端下載都要花好幾分鐘。iOS 自動鎖定螢幕時會凍結網頁、切斷進行中的連線（Safari 只會回報「Load failed」），
-  // 所以兩者都要保持螢幕亮起；任何一個還在進行，就不釋放。
   function wakeWanted() { return uploading || !!cloudOp; }
   function setWakeNote(msg, warn = false) {
     for (const id of ['wakeNote', 'cloudWakeNote']) {
@@ -1291,7 +1315,7 @@
     if (!('wakeLock' in navigator)) { setWakeNote(`⚠️ 這個瀏覽器不支援螢幕常亮，${what}期間請手動保持螢幕亮起。`, true); return false; }
     try {
       const lock = await navigator.wakeLock.request('screen');
-      if (!wakeWanted()) { try { await lock.release(); } catch (e) { /* 忽略 */ } return false; } // 等待期間工作已結束
+      if (!wakeWanted()) { try { await lock.release(); } catch (e) { /* 忽略 */ } return false; }
       wakeLock = lock;
       setWakeNote(`🔆 ${what}期間會保持螢幕亮起。`);
       return true;
@@ -1306,7 +1330,6 @@
     if (lock && !lock.released) { try { await lock.release(); } catch (e) { /* 忽略 */ } }
     setWakeNote('');
   }
-  // 頁面被切到背景時系統會自動釋放喚醒鎖；回到前景要重新要求
   document.addEventListener('visibilitychange', () => {
     const hidden = document.visibilityState === 'hidden';
     if (dlDiag) { dlDiag.log(hidden ? '畫面離開（切到背景或螢幕鎖定）' : '畫面回到前景'); if (hidden) dlDiag.hidden++; }
@@ -1318,8 +1341,6 @@
   window.addEventListener('offline', () => { if (dlDiag) dlDiag.log('網路中斷'); });
 
   // ===== 上傳前檢查雲端剩餘空間 =====
-  // 回傳 { proceed }。取不到容量資訊時不擋（只記 console）；空間不足時交給使用者決定，
-  // 因為「已存在的重複檔」會被跳過，實際需要的空間可能比總大小少。
   async function confirmEnoughSpace(jobs) {
     const need = jobs.reduce((sum, f) => sum + f.size, 0);
     let quota;
@@ -1330,7 +1351,7 @@
       console.warn('無法取得雲端容量，略過空間檢查:', e.message);
       return { proceed: true };
     }
-    if (!quota || !quota.limit) return { proceed: true }; // 沒有容量上限
+    if (!quota || !quota.limit) return { proceed: true };
     const free = Math.max(0, Number(quota.limit) - Number(quota.usage || 0));
     if (need <= free) return { proceed: true };
     const ok = confirm(
@@ -1342,18 +1363,13 @@
   }
 
   // ===== 本機備份帳本（IndexedDB） =====
-  // 記住「哪個本機檔案已備份成 Drive 上的哪個檔案」，之後重複選取同一批照片時，
-  // 不必逐檔做 EXIF 分類、查資料夾、查重複、上傳。
-  // 帳本只是加速用的快取，Drive 才是事實：命中帳本的檔案，跳過前一定會向 Drive 驗證
-  // 「檔案還在、沒進垃圾桶、大小相符」，驗證不過就照常重新備份。所以帳本遺失或過時只會變慢，不會漏備份。
-  // 帳本以 Google 帳號（permissionId）分開，換帳號不會互相影響。
   const LEDGER_DB = 'iphoneBackupLedger';
   const LEDGER_STORE = 'files';
-  const LEDGER_VERIFY_GET_LIMIT = 25; // 命中數 ≤ 此值：逐檔 files.get；超過：一次列出整個備份清單比對
+  const LEDGER_VERIFY_GET_LIMIT = 25;
   const fingerprint = f => `${f.name}|${f.size}|${f.lastModified}`;
   const ledgerId = (acct, f) => `${acct}|${fingerprint(f)}`;
   const inLedger = f => !!ledgerAcct && ledgerKeys.has(ledgerId(ledgerAcct, f));
-  const generatedFiles = new WeakSet(); // 程式產生的 .vcf/.ics（檔名帶時間戳，每次都是新檔），不進帳本
+  const generatedFiles = new WeakSet();
 
   const idbReq = r => new Promise((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
   const txDone = tx => new Promise((resolve, reject) => {
@@ -1366,7 +1382,7 @@
     if (!ledgerDbPromise) {
       ledgerDbPromise = new Promise((resolve, reject) => {
         if (!window.indexedDB) return reject(new Error('此瀏覽器不支援 IndexedDB'));
-        const req = indexedDB.open(LEDGER_DB, 2); // v2：新增備份紀錄（runs、runItems）；帳本資料原封不動
+        const req = indexedDB.open(LEDGER_DB, 2);
         req.onupgradeneeded = () => {
           const db = req.result;
           if (!db.objectStoreNames.contains(LEDGER_STORE)) {
@@ -1407,7 +1423,6 @@
     ids.forEach(id => ledgerKeys.delete(id));
   }
 
-  // 以 Drive 的 permissionId 當帳號識別碼（不含 email）。取不到就回傳 null：本次不使用帳本，備份照常進行。
   async function getLedgerAccount() {
     if (ledgerAcct) return ledgerAcct;
     if (!ledgerAcctPromise) {
@@ -1417,11 +1432,11 @@
           const r = await apiRequest('https://www.googleapis.com/drive/v3/about?fields=user(permissionId)');
           const id = r && r.user && r.user.permissionId;
           if (!id) throw new Error('Drive 沒有回傳帳號識別碼');
-          if (epoch === ledgerEpoch) ledgerAcct = id; // 期間若已斷線／換帳號，不採用這個結果
+          if (epoch === ledgerEpoch) ledgerAcct = id;
           return id;
         } catch (e) {
           console.warn('無法取得 Google 帳號識別碼，本次不使用帳本:', e.message);
-          if (epoch === ledgerEpoch) ledgerAcctPromise = null; // 失敗不快取，下次再試
+          if (epoch === ledgerEpoch) ledgerAcctPromise = null;
           return null;
         }
       })();
@@ -1441,7 +1456,6 @@
     } catch (e) { console.warn('讀取帳本失敗:', e); }
   }
 
-  // 成功上傳、或發現 Drive 已有「同名同大小」檔案時記一筆。寫入失敗不影響備份。
   async function ledgerRecord(file, driveId, folderId, uploadName, md5) {
     if (!driveId || generatedFiles.has(file)) return;
     try {
@@ -1460,10 +1474,6 @@
     } catch (e) { console.warn('寫入帳本失敗（不影響備份）:', e); }
   }
 
-  // 向 Drive 確認這些帳本紀錄對應的檔案是否還在。
-  // 回傳 { confirmed, stale }（都是 Drive 檔案 ID 的 Set）：
-  //   confirmed = 仍存在、不在垃圾桶、大小相符；stale = 確定已不存在／在垃圾桶／大小不符。
-  //   兩者都不含的（例如網路錯誤）代表「無法確認」：不跳過、也不刪帳本，交給一般流程處理。
   async function verifyDriveFiles(records, opts = {}) {
     const check = opts.cancellable === false ? () => {} : throwIfCancelled;
     const confirmed = new Set(), stale = new Set();
@@ -1484,7 +1494,6 @@
       return { confirmed, stale };
     }
 
-    // 筆數多：一次列出本 App 建立的所有未刪除檔案（每頁 1000 筆），比逐檔查詢省很多請求
     const sizes = new Map(records.map(r => [r.driveId, r.size]));
     const q = "trashed = false and mimeType != 'application/vnd.google-apps.folder'";
     let pageToken = null;
@@ -1494,12 +1503,10 @@
       for (const f of res.files || []) if (sizes.has(f.id) && Number(f.size) === sizes.get(f.id)) confirmed.add(f.id);
       pageToken = res.nextPageToken || null;
     } while (pageToken);
-    // 整份清單都讀完了才會走到這裡：沒出現在清單裡的，就是確定不在了
     sizes.forEach((_, id) => { if (!confirmed.has(id)) stale.add(id); });
     return { confirmed, stale };
   }
 
-  // 備份前先比對帳本：已備份且 Drive 驗證仍在的檔案直接跳過（不分類、不查重複、不上傳）。
   async function planWithLedger(jobs) {
     const plan = { toProcess: jobs, ledgerSkipped: [], stale: 0, skipRecs: new Map() };
     const acct = await getLedgerAccount();
@@ -1534,7 +1541,6 @@
     return plan;
   }
 
-  // ----- 設定頁：帳本資訊、同步驗證、清除；備份頁：移除已備份的檔案 -----
   function setLedgerMsg(msg, ok) {
     const m = $('ledgerMsg'); if (!m) return;
     m.className = 'hint ' + (ok === true ? 'success' : ok === false ? 'error' : '');
@@ -1546,7 +1552,7 @@
     if ($('ledgerSync')) $('ledgerSync').disabled = true;
     try {
       let persisted = null;
-      try { if (navigator.storage && navigator.storage.persisted) persisted = await navigator.storage.persisted(); } catch (e) { /* 不支援就略過 */ }
+      try { if (navigator.storage && navigator.storage.persisted) persisted = await navigator.storage.persisted(); } catch (e) { /* 忽略 */ }
       const persistText = persisted === true ? '已啟用' : persisted === false ? '未啟用（儲存空間吃緊時，系統可能清除帳本；清除只會讓備份變慢）' : '未知';
       if (!accessToken) {
         const { store } = await ledgerStore();
@@ -1569,7 +1575,7 @@
     await refreshLedgerKeys();
     refreshSelection();
     renderLedgerStats();
-    renderHistory(); renderLastBackup(); // 已取得帳號：改成只顯示這個帳號的紀錄
+    renderHistory(); renderLastBackup();
   }
 
   async function pruneBackedUp() {
@@ -1628,12 +1634,11 @@
   if ($('ledgerClear')) $('ledgerClear').addEventListener('click', clearLedger);
   if ($('pruneBackedUp')) $('pruneBackedUp').addEventListener('click', pruneBackedUp);
 
-  // ===== 備份紀錄（IndexedDB）、「上次備份」提醒、匯出 =====
-  // 'runs' 存每次備份的摘要；'runItems' 存逐檔結果（另外放，列表只讀摘要，不必把幾千筆檔案一起載入）。
+  // ===== 備份紀錄 =====
   const RUNS_STORE = 'runs';
   const ITEMS_STORE = 'runItems';
-  const RUNS_KEEP = 50;             // 最多保留最近幾次
-  const RUN_ITEMS_CAP = 20000;      // 單次備份最多記錄幾個檔案（超過仍會計入統計）
+  const RUNS_KEEP = 50;
+  const RUN_ITEMS_CAP = 20000;
   const REMIND_KEY = 'iphoneBackupRemindDays';
   const RUN_STATUS = { running: '進行中', complete: '完成', partial: '部分完成', cancelled: '已取消', stopped: '已中止', interrupted: '中斷', failed: '失敗' };
   const RESULT_LABEL = { uploaded: '已上傳', 'dup-skip': '跳過（雲端已有）', 'ledger-skip': '跳過（帳本）', failed: '失敗', unprocessed: '未處理' };
@@ -1682,7 +1687,6 @@
     await runsDelete(all.slice(RUNS_KEEP).map(r => r.id));
   }
 
-  // 所有紀錄寫入都是「盡力而為」：失敗只記 console，不影響備份本身
   async function beginRun(kind, notes) {
     try { await getLedgerAccount(); } catch (e) { /* 取不到帳號就不分帳號 */ }
     const startedAt = Date.now();
@@ -1715,7 +1719,6 @@
     run.updatedAt = item.at;
   }
 
-  // 備份途中定期存檔：App 被 iOS 關掉時，已完成的部分仍留在紀錄裡
   let checkpointBusy = false;
   async function runCheckpoint(run) {
     const n = run.items.length;
@@ -1732,7 +1735,6 @@
     if (currentRun === run) currentRun = null;
   }
 
-  // App 在備份途中被關閉：下次開啟時把「進行中」標成「中斷」
   async function markInterruptedRuns() {
     try {
       const stuck = (await runsAll()).filter(r => r.status === 'running' && !(currentRun && currentRun.id === r.id));
@@ -1740,7 +1742,6 @@
     } catch (e) { console.warn('整理中斷的備份紀錄失敗:', e); }
   }
 
-  // 舊版（v3.8 以前）只留最近 5 筆摘要在 localStorage：搬進新紀錄，只做一次
   async function migrateLegacyHistory() {
     let legacy = [];
     try { legacy = JSON.parse(localStorage.getItem('iphoneBackupHistory') || '[]'); } catch (e) { return; }
@@ -1749,7 +1750,7 @@
       const now = new Date();
       for (let i = 0; i < legacy.length; i++) {
         const h = legacy[i], m = /^(\d+)\/(\d+) (\d+):(\d+)$/.exec(String(h.time));
-        let ts = now.getTime() - (i + 1) * 3600000; // 解析不到時間：排在後面即可
+        let ts = now.getTime() - (i + 1) * 3600000;
         if (m) {
           let d = new Date(now.getFullYear(), Number(m[1]) - 1, Number(m[2]), Number(m[3]), Number(m[4]));
           if (d.getTime() > now.getTime() + 86400000) d = new Date(now.getFullYear() - 1, Number(m[1]) - 1, Number(m[2]), Number(m[3]), Number(m[4]));
@@ -1767,13 +1768,11 @@
     } catch (e) { console.warn('搬移舊版紀錄失敗:', e); }
   }
 
-  // 已連線：只顯示目前帳號（與沒有帳號資訊的舊紀錄）；未連線：全部顯示
   async function visibleRuns() {
     const all = await runsAll();
     return (accessToken && ledgerAcct) ? all.filter(r => !r.acct || r.acct === ledgerAcct) : all;
   }
 
-  // ----- 上次備份 -----
   const getRemindDays = () => { const v = Number(localStorage.getItem(REMIND_KEY)); return Number.isFinite(v) && localStorage.getItem(REMIND_KEY) !== null ? v : 7; };
 
   async function renderLastBackup() {
@@ -1813,7 +1812,6 @@
     detail.style.whiteSpace = 'pre-line';
   }
 
-  // ----- 備份紀錄列表 -----
   const FILE_PAGE = 200;
 
   function runFileRow(it) {
@@ -1905,7 +1903,6 @@
     }));
   }
 
-  // ----- 匯出 -----
   const csvCell = v => { let s = String(v ?? ''); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
   function runsToCsv(runs) {
     const head = ['備份開始', '備份結束', '狀態', '檔名', '大小(bytes)', '結果', '雲端資料夾', 'Drive檔案ID', '雲端檔名', 'MD5驗證', '錯誤訊息', '耗時(ms)'];
@@ -1917,14 +1914,13 @@
           it.folder, it.driveId, it.uploadName, MD5_LABEL[it.md5] || it.md5 || '', it.error, it.ms].map(csvCell).join(','));
       }
     }
-    return '﻿' + rows.join('\r\n') + '\r\n'; // BOM：Excel 才會正確顯示中文
+    return '﻿' + rows.join('\r\n') + '\r\n';
   }
 
-  // 小檔案交付：觸控裝置優先開啟分享表單（可「儲存到檔案」），否則一般下載
   async function deliverFile(file) {
     if (navigator.maxTouchPoints > 1 && navigator.canShare && navigator.share) {
       try { if (navigator.canShare({ files: [file] })) { await navigator.share({ files: [file] }); return 'shared'; } }
-      catch (e) { if (e && e.name === 'AbortError') return 'dismissed'; /* 其他錯誤：改用下載 */ }
+      catch (e) { if (e && e.name === 'AbortError') return 'dismissed'; }
     }
     anchorDownload(file, file.name);
     return 'downloaded';
@@ -1958,22 +1954,18 @@
     await renderHistory(); renderLastBackup();
   }
 
-  // ===== iPhone 本機／iCloud 聯絡人與行事曆：從「檔案」App 選 .vcf / .ics =====
-  // 網頁讀不到本機通訊錄與行事曆，所以由使用者先在 iPhone 匯出成檔案。這裡負責：
-  // 檢查選到的真的是 vCard／iCalendar（避免選錯檔）、顯示筆數、加上日期時間後和其他檔案一起備份。
-  // 檔名帶時間戳，每次都是一份新的快照，所以不進「本機備份帳本」（否則內容變了但大小相同時會被誤判為已備份）。
+  // ===== iPhone 本機／iCloud 聯絡人與行事曆 =====
   const pimFiles = []; // { key, orig, file, kind, count }
   const PIM = {
     vcf: { label: '聯絡人', icon: '👤', head: /^BEGIN:VCARD/i, marker: 'BEGIN:VCARD', unit: '位聯絡人', mime: 'text/vcard', ext: '.vcf' },
     ics: { label: '行事曆', icon: '📅', head: /^BEGIN:VCALENDAR/i, marker: 'BEGIN:VEVENT', unit: '個事件', mime: 'text/calendar', ext: '.ics' }
   };
 
-  // 分段計算標記出現次數（大檔不必整個讀進記憶體；以保留尾端的方式處理跨段的標記）
   async function countMarker(file, marker) {
     const re = new RegExp('\\n' + marker, 'gi');
     const dec = new TextDecoder('utf-8');
-    const CH = 2 * 1024 * 1024, keep = marker.length; // 「換行＋標記」比保留的尾端長，所以不會重複計算
-    let carry = '\n', count = 0;                      // 開頭先補一個換行，檔案第一行也能比對到
+    const CH = 2 * 1024 * 1024, keep = marker.length;
+    let carry = '\n', count = 0;
     for (let off = 0; off < file.size; off += CH) {
       const buf = new Uint8Array(await file.slice(off, Math.min(off + CH, file.size)).arrayBuffer());
       const text = carry + dec.decode(buf, { stream: off + CH < file.size });
@@ -2006,7 +1998,6 @@
       try { info = await inspectPim(f, kind); } catch (e) { info = { ok: false, why: '讀取失敗：' + e.message }; }
       if (!info.ok) { notes.push(`「${f.name}」沒有加入：${info.why}`); continue; }
       const base = f.name.replace(/\.[^.]*$/, '') || spec.label;
-      // new File([f], …) 只是參照原檔資料，不會複製一份到記憶體
       const file = new File([f], `iPhone_${spec.label}_${safeSeg(base)}_${stampTag()}${spec.ext}`, { type: spec.mime, lastModified: f.lastModified });
       generatedFiles.add(file);
       pimFiles.push({ key, orig: f.name, file, kind, count: info.count });
@@ -2027,7 +2018,7 @@
     }));
   }
 
-  // ===== 備份流程：忙碌狀態、取消、執行、只重試失敗 =====
+  // ===== 備份流程 =====
   function setBusy(busy) {
     uploading = busy;
     if (busy) {
@@ -2051,21 +2042,20 @@
     cancelRequested = true;
     $('cancelBackup').disabled = true; $('cancelBackup').textContent = '正在取消…';
     $('uploadState').textContent = '取消中';
-    if (currentXhr) currentXhr.abort();                       // 正在傳的檔案立刻中止
-    if (!$('reauthBox').hidden) $('reauthCancel').click();    // 正在等重新授權：一併結束等待
+    if (currentXhr) currentXhr.abort();
+    if (!$('reauthBox').hidden) $('reauthCancel').click();
   }
 
-  // 外層：建立／結束備份紀錄。任何離開方式（正常完成、取消、例外）都會把紀錄收尾，不會留下「進行中」。
   async function runJobs(allJobs, notes = [], kind = 'backup') {
     const run = await beginRun(kind, notes);
-    const seen = new Set(); // 已經有結果的檔案；收尾時沒出現的一律記成「未處理」
+    const seen = new Set();
     try {
       await runJobsCore(allJobs, notes, run, seen);
     } catch (err) {
       if (run.status === 'running') { addUnprocessed(run, allJobs, seen); await finishRun(run, err.cancelled ? 'cancelled' : 'failed', err.cancelled ? '' : err.message); }
       throw err;
     } finally {
-      if (run.status === 'running') { addUnprocessed(run, allJobs, seen); await finishRun(run, 'cancelled'); } // 提早結束（取消、空間不足）
+      if (run.status === 'running') { addUnprocessed(run, allJobs, seen); await finishRun(run, 'cancelled'); }
       renderHistory(); renderLastBackup();
     }
   }
@@ -2075,13 +2065,12 @@
   }
 
   async function runJobsCore(allJobs, notes, run, seen) {
-    failedJobs = allJobs.slice(); // 先假設全部都要重試；途中若丟出例外，下次仍可重試
+    failedJobs = allJobs.slice();
     exifrMissingCount = 0;
     let success = 0;
     const skipped = [], renamed = [], failures = [], failedFiles = [];
-    let stopIndex = -1, stopReason = null; // stopIndex 起算的檔案都視為「未處理」
+    let stopIndex = -1, stopReason = null;
 
-    // 先比對本機帳本：已備份且 Drive 驗證仍在的檔案直接跳過，不做分類／查重複／上傳
     $('uploadState').textContent = '比對本機帳本';
     let plan;
     try { plan = await planWithLedger(allJobs); }
@@ -2119,7 +2108,7 @@
       const file = jobs[i];
       $('uploadState').textContent = `處理中 ${i+1}/${jobs.length}`;
       const t0 = Date.now();
-      const vstate = { md5: '' }; // 上傳流程回報的 MD5 驗證結果
+      const vstate = { md5: '' };
 
       try {
         $('progressText').textContent = `分析分類：${file.name}`;
@@ -2133,7 +2122,7 @@
         if (dup.duplicate) {
           skipped.push(file.name);
           console.log(`跳過重複檔案（檔名與大小相同）: ${file.name}`);
-          await ledgerRecord(file, dup.existingId, targetFolderId, dup.existingName); // 認領 Drive 上既有的備份，下次可直接由帳本跳過
+          await ledgerRecord(file, dup.existingId, targetFolderId, dup.existingName);
           seen.add(file);
           recordItem(run, file, { result: 'dup-skip', driveId: dup.existingId, uploadName: dup.existingName, folder: target.path, ms: Date.now() - t0 });
         } else {
@@ -2149,17 +2138,16 @@
           recordItem(run, file, { result: 'uploaded', driveId: up && up.id, uploadName: up && up.name, folder: target.path, md5: vstate.md5, ms: Date.now() - t0 });
         }
       } catch (err) {
-        // 使用者取消：這個檔案算「未處理」（可能傳到一半），重試時會再檢查重複
         if (err.cancelled || (err.aborted && cancelRequested)) { stopIndex = i; stopReason = 'cancel'; break; }
         failures.push(`${file.name}：${err.message}`);
         failedFiles.push(file);
         seen.add(file);
         recordItem(run, file, { result: 'failed', error: err.message, md5: vstate.md5, ms: Date.now() - t0 });
-        if (err.aborted) { stopIndex = i + 1; stopReason = 'reauth'; break; } // 放棄重新授權：停止後續檔案
-        if (err.quota) { stopIndex = i + 1; stopReason = 'quota'; break; }    // 雲端空間已滿：停止後續檔案
+        if (err.aborted) { stopIndex = i + 1; stopReason = 'reauth'; break; }
+        if (err.quota) { stopIndex = i + 1; stopReason = 'quota'; break; }
       }
       $('progress').value = ((i + 1) / jobs.length) * 100;
-      runCheckpoint(run); // 不等待；App 被關掉時已完成的部分仍會留在紀錄裡
+      runCheckpoint(run);
     }
 
     const unprocessed = stopIndex >= 0 ? jobs.slice(stopIndex) : [];
@@ -2199,7 +2187,6 @@
     if (wantContacts && !hasScope(SCOPE_CONTACTS)) { showResult('尚未授權讀取聯絡人，請取消勾選後重新勾選一次。', 'error'); return; }
     if (wantCalendar && !hasScope(SCOPE_CALENDAR)) { showResult('尚未授權讀取行事曆，請取消勾選後重新勾選一次。', 'error'); return; }
 
-    // EXIF 套件沒載入時，照片會改用檔案時間分類，結果可能不對：先讓使用者知道
     if (!window.exifr && selectedFiles.some(f => isMedia(f) && (f.type.startsWith('image/') || EXIF_EXT.test(f.name)))) {
       if (!confirm('⚠️ EXIF 解析套件沒有載入成功。\n\n照片會改用「檔案修改時間」分類，可能被放到錯誤的年月或「未分類照片」。\n\n建議先重新整理頁面。要仍然繼續備份嗎？')) return;
     }
@@ -2208,7 +2195,6 @@
     failedJobs = [];
     $('uploadState').textContent = '準備中'; showResult('');
 
-    // 先確認授權有效（若需要續期，此時仍在使用者點擊的手勢內，彈窗較不會被 iOS 擋下）
     try { await ensureToken(); }
     catch (err) {
       showResult('授權未完成：' + err.message, 'error'); $('uploadState').textContent = '失敗';
@@ -2216,7 +2202,7 @@
     }
 
     const notes = [];
-    const generated = []; // 產生的 .vcf/.ics 另外存放，不混進使用者的選取清單
+    const generated = [];
     try {
       if (wantContacts) { const r = await generateContactsVcf(); generated.push(r.file); notes.push(`聯絡人 ${r.count} 筆`); throwIfCancelled(); }
       if (wantCalendar) { const r = await generateCalendarIcs(); generated.push(r.file); notes.push(`行事曆事件 ${r.count} 筆（${r.calendars} 個行事曆）`); throwIfCancelled(); }
@@ -2236,7 +2222,7 @@
     } finally {
       $('includeContacts').checked = false;
       $('includeCalendar').checked = false;
-      pimFiles.length = 0; renderPim(); // 已交給備份流程；失敗的會留在「只重試」清單
+      pimFiles.length = 0; renderPim();
       setBusy(false);
     }
   }
@@ -2250,7 +2236,7 @@
     try { await ensureToken(); }
     catch (err) {
       showResult('授權未完成：' + err.message, 'error'); $('uploadState').textContent = '失敗';
-      setBusy(false); return; // failedJobs 保持不變，仍可再試
+      setBusy(false); return;
     }
     try {
       await runJobs(jobs, ['這是只重試失敗／未完成檔案的結果'], 'retry');
@@ -2266,9 +2252,6 @@
   $('retryFailed').addEventListener('click', retryFailed);
 
   // ===== PWA 更新流程 =====
-  // 原本的問題：① 按確定後立刻 reload，新 SW 還沒接手，可能又載到舊版；
-  // ② 備份進行中跳 confirm 並重新載入，會把上傳整個中斷；
-  // ③ 上次忽略提示後，下次開啟時新版仍在待命，但不會再有任何提示。
   function initServiceWorker() {
     if (!('serviceWorker' in navigator) || !location.protocol.startsWith('http')) return;
     const hadController = !!navigator.serviceWorker.controller;
@@ -2286,11 +2269,10 @@
 
     function offer(worker) { waiting = worker; mode = 'update'; updateRequested = false; renderBar(); }
 
-    // 新 SW 真正接手後才重新載入（不是按下按鈕就載入）
     navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (!hadController || reloading) return; // 第一次安裝時 clients.claim() 也會觸發，不需重載
+      if (!hadController || reloading) return;
       if (updateRequested && !uploading) { reloading = true; location.reload(); return; }
-      mode = 'reload'; renderBar();            // 其他視窗已更新，或更新途中使用者開始了備份
+      mode = 'reload'; renderBar();
     });
 
     $('updateNow').addEventListener('click', () => {
@@ -2310,19 +2292,39 @@
       try {
         const reg = await navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' });
         swReg = reg;
-        if (reg.waiting && navigator.serviceWorker.controller) offer(reg.waiting); // 先前忽略、仍在待命的新版
+        if (reg.waiting && navigator.serviceWorker.controller) offer(reg.waiting);
         reg.addEventListener('updatefound', () => {
           const nw = reg.installing; if (!nw) return;
           const check = () => { if (nw.state === 'installed' && navigator.serviceWorker.controller) offer(nw); };
           nw.addEventListener('statechange', check);
           check();
         });
-        setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000); // 常駐的 App 也會定期檢查
+        setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
       } catch (err) { console.error('SW 註冊失敗:', err); }
     }
     if (document.readyState === 'complete') register(); else window.addEventListener('load', register);
   }
   initServiceWorker();
+
+  // 【新增】App 啟動時嘗試恢復尚未過期的 Token
+  (function restoreToken() {
+    try {
+      const saved = JSON.parse(localStorage.getItem('iphoneBackupAuth') || 'null');
+      if (saved && saved.expire > Date.now() + 60000) {
+        accessToken = saved.token;
+        tokenExpiresAt = saved.expire;
+        grantedScopes = new Set(saved.scopes || []);
+        connectedOnce = true;
+        $('connection').textContent = '已連線 (自動恢復)'; $('connection').className = 'pill ok';
+        $('disconnect').disabled = false;
+        $('uploadState').textContent = '已連線';
+        refreshSelection();
+        // 背景自動載入帳本與雲端清單
+        initLedger();
+        loadCloudFiles();
+      }
+    } catch (e) { console.warn('恢復授權失敗', e); }
+  })();
 
   if (!window.exifr && $('exifrWarn')) $('exifrWarn').hidden = false;
   // ===== 設定項目與啟動 =====
@@ -2344,6 +2346,6 @@
     try { await migrateLegacyHistory(); await markInterruptedRuns(); } catch (e) { console.warn('整理備份紀錄失敗:', e); }
     renderHistory(); renderLastBackup();
   })();
-  setInterval(renderLastBackup, 60000); // 「X 分鐘前」會自己更新
+  setInterval(renderLastBackup, 60000);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') renderLastBackup(); });
 })();
