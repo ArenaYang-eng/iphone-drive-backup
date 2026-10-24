@@ -1,5 +1,5 @@
 const CACHE_PREFIX = 'iphone-drive-backup-';
-const CACHE_NAME = CACHE_PREFIX + 'v13'; // 每次發版：與 index.html / app.js 的 APP_VERSION 一起更新
+const CACHE_NAME = CACHE_PREFIX + 'v14'; // 每次發版：與 index.html / app.js 的 APP_VERSION 一起更新
 const APP_SHELL = [
   './', './index.html', './app.js', './md5.js', './zipstream.js', './exifr.full.umd.js',
   './manifest.webmanifest', './icon-192.png', './icon-512.png'

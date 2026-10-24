@@ -1,5 +1,5 @@
 (() => {
-  const APP_VERSION = 'v4.1';
+  const APP_VERSION = 'v4.2';
   const $ = id => document.getElementById(id);
   
   const verEl = $('versionDisplay');
@@ -708,6 +708,7 @@
     $('cloudOpProgress').hidden = true; $('cloudOpTap').hidden = true;
     $('cloudOpCancel').hidden = false; $('cloudOpCancel').disabled = false; $('cloudOpCancel').textContent = '關閉';
     setCloudButtons(false);
+    showIosNote(false);
     if (!uploading) releaseWakeLock();
   }
   function opCancel() {
@@ -768,6 +769,21 @@
     a.href = url; a.download = name; a.hidden = true;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 120000); // iOS 需要時間讀取，晚一點才釋放
+  }
+
+  // iOS 主畫面 App（standalone）的系統限制：下載完成後，iOS 會用「檔案預覽」整個蓋住 App，而且沒有返回鍵
+  // （WebKit 已知問題，網頁無法控制）。Safari 分頁沒有這個問題。所以在主畫面 App 下載時，事先把出路說清楚。
+  function isStandalone() {
+    return window.navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  }
+  const IOS_PREVIEW_NOTE =
+    '⚠️ 主畫面 App 的限制：下載完成後，iOS 會跳出檔案預覽，而且沒有返回鍵。\n' +
+    '・影片／照片：點「更多…」→「儲存影片／儲存影像」就會存入相簿。\n' +
+    '・要回到本頁：先從螢幕左邊緣往右滑；沒反應就從螢幕底部上滑、把本 App 往上滑掉，再從主畫面重新開啟（重開後要再按一次「連線 Google」）。\n' +
+    '・想避開這個預覽畫面：改用 Safari 分頁開啟本網址下載，檔案會進「檔案」App 的「下載項目」，頁面不會被蓋住。';
+  function showIosNote(show) {
+    const n = $('cloudIosNote'); if (!n) return;
+    n.textContent = show ? IOS_PREVIEW_NOTE : ''; n.hidden = !show;
   }
 
   // ----- 下載診斷：失敗時要說得出「卡在哪一步」 -----
@@ -887,6 +903,7 @@
       const id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
       const ch = new MessageChannel();
       const reader = (source || new Blob([]).stream()).getReader();
+      if (isStandalone()) showIosNote(true);
       let sent = 0, srcDone = false, settled = false, pumping = false, lastPull = Date.now(), loggedAt = 0, pulled = false;
       const log = m => { if (diag) diag.log(m); };
 
