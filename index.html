@@ -10,331 +10,396 @@
   <link rel="apple-touch-icon" href="./icon-192.png">
   <title>我的備份中心</title>
   <style>
-    :root { color-scheme: light; --blue:#1769aa; --ink:#18212b; --muted:#5f6b76; --line:#dce3e9; --bg:#f4f7fa; }
-    * { box-sizing:border-box; }
-    [hidden] { display:none !important; }
-    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--bg); }
-    main { max-width:720px; margin:0 auto; padding:20px 16px calc(32px + env(safe-area-inset-bottom)); }
-    header { display:flex; gap:12px; align-items:center; margin:8px 0 20px; }
-    .logo { width:48px;height:48px;border-radius:14px;background:var(--blue);color:white;display:grid;place-items:center;font-size:24px; }
-    h1 { font-size:23px; margin:0 0 4px; } h2 { font-size:17px; margin:0 0 12px; }
-    .sub,.hint { color:var(--muted); font-size:13px; line-height:1.55; }
-    .card { background:white; border:1px solid var(--line); border-radius:16px; padding:16px; margin:12px 0; box-shadow:0 2px 8px #10203008; }
-    button,.button { display:inline-flex; justify-content:center; align-items:center; min-height:44px; padding:11px 14px; border:0; border-radius:11px; background:var(--blue); color:white; font-size:15px; font-weight:600; text-decoration:none; cursor:pointer; }
-    button.secondary { background:#e8f1f8; color:#154f7e; }
-    button:disabled { opacity:.45; cursor:not-allowed; }
-    .full { width:100%; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    .status { display:flex; justify-content:space-between; gap:10px; align-items:center; }
-    .pill { border-radius:999px; background:#eef2f5; padding:5px 9px; font-size:12px; color:#43505b; white-space:nowrap; }
-    .pill.ok { background:#e4f6eb; color:#17633a; } .pill.warn { background:#fff3d7;color:#805400; }
-    .picker { display:block; padding:14px; border:1px dashed #9cb2c5; border-radius:12px; margin:10px 0; }
-    .picker strong { display:block; margin-bottom:5px; } input[type=file] { display:block; width:100%; margin-top:10px; font-size:14px; }
-    ul { list-style:none; margin:0; padding:0; } li.file { padding:10px 0; border-bottom:1px solid #edf0f3; overflow-wrap:anywhere; } li.file:last-child { border-bottom:0; }
-    .filemeta { color:var(--muted); font-size:12px; margin-top:4px; }
-    progress { width:100%; height:12px; margin:10px 0; accent-color:var(--blue); }
-    .success { color:#17633a; } .error { color:#a52a2a; white-space:pre-wrap; }
-    details summary { cursor:pointer; font-weight:600; color:var(--blue); padding:8px 0; }
-    input[type=text] { width:100%; padding:12px; border:1px solid #bcc9d4; border-radius:10px; font-size:15px; }
-    footer { text-align:center; color:var(--muted); font-size:12px; margin-top:20px; }
-
-    /* Tab 切換樣式 */
-    .tabs { display:flex; margin-bottom:16px; background:#e2e8f0; padding:4px; border-radius:12px; }
-    .tab-btn { flex:1; text-align:center; padding:10px; font-size:14px; font-weight:600; color:var(--muted); border-radius:9px; cursor:pointer; border:none; background:transparent; transition:0.2s; }
-    .tab-btn.active { background:white; color:var(--blue); box-shadow:0 2px 4px #0000000d; }
-    .tab-content { display:none; }
-    .tab-content.active { display:block; animation:fadeIn 0.3s; }
-    @keyframes fadeIn { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:translateY(0); } }
+    :root { 
+      color-scheme: light; 
+      --blue: #1769aa; 
+      --blue-light: #e8f1f8;
+      --ink: #18212b; 
+      --muted: #5f6b76; 
+      --line: #dce3e9; 
+      --bg: #f4f7fa; 
+      --success: #17633a;
+      --danger: #a52a2a;
+      --warning: #805400;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    [hidden] { display: none !important; }
+    body { 
+      margin: 0; 
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+      color: var(--ink); 
+      background: var(--bg); 
+      line-height: 1.5;
+    }
+    main { max-width: 640px; margin: 0 auto; padding: 16px 16px calc(32px + env(safe-area-inset-bottom)); }
     
-    /* 雲端清單／紀錄（由 JS 以 DOM 建立，不用 inline style） */
-    .cloud-row { padding:8px 0; border-bottom:1px dashed #eee; display:flex; justify-content:space-between; align-items:center; gap:8px; }
-    .cloud-info { min-width:0; overflow-wrap:anywhere; }
-    .cloud-folder { color:var(--blue); cursor:pointer; font-weight:700; }
-    .cloud-file { color:var(--ink); font-weight:700; }
-    .cloud-sub { font-size:11px; }
-    .btn-small { min-height:28px; padding:4px 10px; font-size:12px; }
-    .crumb-path { font-weight:bold; color:var(--ink); }
-    .hist-item { margin-bottom:6px; border-bottom:1px dashed #eee; padding-bottom:4px; }
-    .warn-text { color:#805400; }
-    .warnbox { background:#fff8e6; border:1px solid #f0c36d; border-radius:10px; padding:10px 12px; margin:10px 0; font-size:13px; line-height:1.55; color:#5c3d00; }
-    .update-bar { position:sticky; top:0; z-index:10; display:flex; gap:10px; align-items:center; justify-content:space-between; background:#e8f1f8; border:1px solid #b9d4ea; border-radius:12px; padding:8px 12px; margin:0 0 12px; font-size:13px; color:#154f7e; }
-    .update-bar button { min-height:34px; padding:6px 12px; font-size:13px; flex:none; }
+    /* 頂部標題 */
+    header { display: flex; justify-content: space-between; align-items: center; margin: 4px 0 16px; }
+    h1 { font-size: 22px; margin: 0; display: flex; align-items: center; gap: 8px; }
+    .logo { width: 36px; height: 36px; border-radius: 10px; background: var(--blue); color: white; display: grid; place-items: center; font-size: 20px; }
+    .version-tag { font-size: 11px; color: var(--muted); background: #fff; border: 1px solid var(--line); padding: 2px 6px; border-radius: 6px; }
 
-    /* 說明區塊微調 */
-    .info-box { background:#f8fafc; border-left:4px solid var(--blue); padding:10px 12px; border-radius:0 8px 8px 0; margin:10px 0; }
-    .pill.bad { background:#fde8e8; color:#8f1d1d; }
-    select { font-size:14px; background:white; border:1px solid #bcc9d4; border-radius:10px; padding:8px; min-height:40px; max-width:100%; }
-    .lastbk { border-left:5px solid #17633a; }
-    .lastbk.warn { border-left-color:#d99a00; background:#fffaf0; }
-    .lastbk.bad { border-left-color:#b3261e; background:#fff6f5; }
-    .check { display:flex; align-items:center; gap:8px; font-size:14px; }
-    .check input { width:20px; height:20px; margin:0; flex:none; }
-    .opbox { background:#f3f8fc; border:1px solid #b9d4ea; border-radius:12px; padding:12px; margin:10px 0; }
-    .opbox progress { margin:8px 0; }
-    .cloud-pick { width:20px; height:20px; margin:0 10px 0 0; flex:none; }
-    .cloud-left { display:flex; align-items:center; min-width:0; flex:1; }
-    .hist-head { cursor:pointer; list-style:none; }
-    .hist-head::-webkit-details-marker { display:none; }
-    .hist-line { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
-    .hist-files { max-height:320px; overflow-y:auto; margin-top:8px; border-top:1px solid #edf0f3; }
-    .hist-file { padding:5px 0; border-bottom:1px dotted #e6ebef; font-size:12px; overflow-wrap:anywhere; }
-    .hist-file .r-uploaded { color:#17633a; } .hist-file .r-failed { color:#a52a2a; } .hist-file .r-unprocessed { color:#805400; }
-    .pim-row { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 0; border-bottom:1px dashed #e6ebef; font-size:13px; overflow-wrap:anywhere; }
-    .steps { padding:4px 0 4px 18px; margin:6px 0; font-size:13px; color:var(--muted); line-height:1.65; list-style:decimal; }
+    /* 吸頂導覽列 */
+    .tabs-container { position: sticky; top: 0; z-index: 100; background: rgba(244, 247, 250, 0.95); backdrop-filter: blur(8px); padding: 8px 0 12px; margin: 0 -16px; }
+    .tabs { display: flex; background: #e2e8f0; padding: 4px; border-radius: 12px; margin: 0 16px; }
+    .tab-btn { flex: 1; text-align: center; padding: 10px; font-size: 14px; font-weight: 600; color: var(--muted); border-radius: 8px; cursor: pointer; border: none; background: transparent; transition: 0.2s; }
+    .tab-btn.active { background: white; color: var(--blue); box-shadow: 0 2px 6px rgba(0,0,0,0.06); }
+    
+    .tab-content { display: none; animation: fadeIn 0.3s ease; }
+    .tab-content.active { display: block; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* 卡片設計 */
+    .card { background: white; border: 1px solid var(--line); border-radius: 16px; padding: 20px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(16,32,48,0.03); }
+    .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .card-header h2 { font-size: 16px; margin: 0; font-weight: 700; display: flex; align-items: center; gap: 6px; }
+    
+    /* 按鈕與輸入框 */
+    button, .button { display: inline-flex; justify-content: center; align-items: center; min-height: 44px; padding: 10px 16px; border: 0; border-radius: 10px; background: var(--blue); color: white; font-size: 15px; font-weight: 600; cursor: pointer; transition: opacity 0.2s; text-decoration: none; }
+    button:active { opacity: 0.8; }
+    button.secondary { background: var(--blue-light); color: var(--blue); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-small { min-height: 32px; padding: 6px 12px; font-size: 13px; border-radius: 8px; }
+    .full { width: 100%; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    input[type=text] { width: 100%; padding: 14px; border: 1px solid var(--line); border-radius: 10px; font-size: 15px; transition: border 0.2s; }
+    input[type=text]:focus { outline: none; border-color: var(--blue); }
+    select { width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 10px; font-size: 14px; background: white; margin-bottom: 8px; }
+    
+    /* 標籤 (Pills) */
+    .pill { border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 600; white-space: nowrap; display: inline-flex; align-items: center; }
+    .pill.ok { background: #e4f6eb; color: var(--success); } 
+    .pill.warn { background: #fff3d7; color: var(--warning); }
+    .pill.bad { background: #fde8e8; color: var(--danger); }
+    .pill.neutral { background: #eef2f5; color: var(--muted); }
+
+    /* 提示文字與警告橫幅 */
+    .hint { color: var(--muted); font-size: 13px; line-height: 1.6; }
+    .alert { border-radius: 10px; padding: 12px 16px; font-size: 13px; line-height: 1.5; margin-bottom: 16px; display: flex; gap: 10px; align-items: flex-start; }
+    .alert-warning { background: #fff8e6; border: 1px solid #f0c36d; color: #5c3d00; }
+    .alert-danger { background: #fdf2f2; border: 1px solid #f5c6c6; color: var(--danger); }
+    .alert-info { background: var(--blue-light); border: 1px solid #b9d4ea; color: #154f7e; }
+
+    /* 折疊面板 (Accordion) */
+    details.accordion { border: 1px solid var(--line); border-radius: 12px; margin-bottom: 12px; background: #fafbfc; overflow: hidden; }
+    details.accordion summary { padding: 14px 16px; font-weight: 600; font-size: 14px; cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center; color: var(--ink); user-select: none; }
+    details.accordion summary::-webkit-details-marker { display: none; }
+    details.accordion summary::after { content: "▼"; font-size: 10px; color: var(--muted); transition: transform 0.2s; }
+    details.accordion[open] summary::after { transform: rotate(180deg); }
+    details.accordion .details-content { padding: 0 16px 16px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); line-height: 1.6; }
+
+    /* 選取區塊 */
+    .picker-box { display: flex; align-items: center; justify-content: space-between; padding: 16px; border: 2px dashed #b0c4d6; border-radius: 12px; margin-bottom: 12px; cursor: pointer; background: #fdfdfd; transition: border 0.2s; }
+    .picker-box:active { border-color: var(--blue); background: var(--blue-light); }
+    .picker-box strong { display: block; font-size: 15px; color: var(--ink); margin-bottom: 4px; }
+    .picker-box span { font-size: 12px; color: var(--muted); }
+    input[type=file] { display: none; }
+    
+    /* 檔案列表 */
+    ul { list-style: none; margin: 0; padding: 0; } 
+    li.file { padding: 10px 0; border-bottom: 1px solid #edf0f3; overflow-wrap: anywhere; font-size: 14px; } 
+    li.file:last-child { border-bottom: 0; }
+    .filemeta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+    /* 進度條 */
+    progress { width: 100%; height: 8px; margin: 12px 0; accent-color: var(--blue); border-radius: 4px; border: none; background: #eef2f5; }
+    progress::-webkit-progress-bar { background: #eef2f5; border-radius: 4px; }
+    progress::-webkit-progress-value { background: var(--blue); border-radius: 4px; }
+
+    /* 雲端清單 */
+    .cloud-row { padding: 12px 0; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    .cloud-row:last-child { border-bottom: 0; }
+    .cloud-left { display: flex; align-items: center; min-width: 0; flex: 1; }
+    .cloud-info { min-width: 0; overflow-wrap: anywhere; }
+    .cloud-folder { color: var(--blue); font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+    .cloud-file { color: var(--ink); font-weight: 600; display: flex; align-items: center; gap: 6px; }
+    .cloud-sub { font-size: 12px; color: var(--muted); margin-top: 2px; display: block; }
+    .cloud-pick { width: 22px; height: 22px; margin: 0 12px 0 0; border-radius: 6px; accent-color: var(--blue); flex: none; }
+
+    /* 歷史紀錄 */
+    .hist-item { border-bottom: 1px solid var(--line); padding: 10px 0; }
+    .hist-head { cursor: pointer; list-style: none; }
+    .hist-head::-webkit-details-marker { display: none; }
+    .hist-line { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+    .hist-files { max-height: 300px; overflow-y: auto; margin-top: 10px; background: #fafbfc; border-radius: 8px; padding: 8px; }
+    .hist-file { padding: 6px 0; border-bottom: 1px dashed var(--line); font-size: 12px; }
+    .hist-file:last-child { border-bottom: none; }
+    .r-uploaded { color: var(--success); font-weight: 600; } 
+    .r-failed { color: var(--danger); font-weight: 600; } 
+    .r-unprocessed { color: var(--warning); font-weight: 600; }
+
+    /* 操作面板 */
+    .opbox { background: var(--blue-light); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    
+    footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 32px; padding-bottom: 20px; }
   </style>
 </head>
 <body>
 <main>
-  <div id="updateBar" class="update-bar" role="status" aria-live="polite" hidden>
-    <span id="updateMsg">發現新版本。</span>
-    <button id="updateNow" class="secondary" type="button">立即更新</button>
+  <!-- 版本更新提示 -->
+  <div id="updateBar" class="update-bar alert alert-info" role="status" aria-live="polite" hidden style="position: relative; z-index: 101; margin-bottom: 12px;">
+    <div style="flex: 1;"><span id="updateMsg">發現新版本。</span></div>
+    <button id="updateNow" class="btn-small" type="button" style="background: white;">立即更新</button>
   </div>
+
   <header>
-    <div class="logo" aria-hidden="true">☁</div>
-    <div style="flex:1; display:flex; justify-content:space-between; align-items:flex-start;">
-      <div>
-        <h1>我的備份中心</h1>
-        <div class="sub">iPhone → Google Drive｜手動選取版 A</div>
-      </div>
-      <span id="versionDisplay" class="pill ok" style="margin-top:4px;">v4.3</span>
-    </div>
+    <h1><div class="logo" aria-hidden="true">☁</div> 備份中心</h1>
+    <span id="versionDisplay" class="version-tag">v3.9.3</span>
   </header>
 
-  <!-- Tab 導覽列 -->
-  <div class="tabs">
-    <button class="tab-btn active" data-target="tab-backup">📤 備份資料</button>
-    <button class="tab-btn" data-target="tab-cloud">☁️ 雲端還原</button>
-    <button class="tab-btn" data-target="tab-settings">⚙️ 設定與說明</button>
+  <!-- 吸頂導覽列 -->
+  <div class="tabs-container">
+    <div class="tabs">
+      <button class="tab-btn active" data-target="tab-backup">📤 備份資料</button>
+      <button class="tab-btn" data-target="tab-cloud">☁️ 雲端還原</button>
+      <button class="tab-btn" data-target="tab-settings">⚙️ 設定與說明</button>
+    </div>
   </div>
 
   <!-- Tab 1: 備份資料 -->
   <div id="tab-backup" class="tab-content active">
-    <section id="lastBackupCard" class="card lastbk" aria-live="polite">
-      <div class="status"><strong id="lastBackupTitle">⏱ 上次備份</strong><span id="lastBackupPill" class="pill">讀取中…</span></div>
-      <div id="lastBackupDetail" class="hint" style="margin-top:6px;"></div>
-    </section>
-
-    <section class="card">
-      <div class="status"><h2>1. Google Drive 連線</h2><span id="connection" class="pill warn">尚未連線</span></div>
-      <p class="hint" style="margin-bottom:8px;">首次設定需要建立 Google OAuth 用戶端 ID。登入後，本頁只取得暫時存取權杖；不會把權杖儲存在本機。連線時只要求 Drive 權限，匯出聯絡人或行事曆時才會在你勾選當下另外請求唯讀授權。</p>
-      <label for="clientId" class="sub">Google OAuth 2.0 用戶端 ID</label>
-      <input id="clientId" type="text" placeholder="例如：123456789-xxxx.apps.googleusercontent.com" autocomplete="off" autocapitalize="none" spellcheck="false">
-      <div class="row" style="margin-top:10px">
-        <button id="saveClient" class="secondary">儲存 ID</button>
-        <button id="connect">連線 Google</button>
-        <button id="disconnect" class="secondary" disabled>清除狀態</button>
+    
+    <!-- 醒目：上次備份狀態 -->
+    <section id="lastBackupCard" class="card lastbk" aria-live="polite" style="padding: 16px; border-left: 4px solid var(--blue);">
+      <div class="card-header" style="margin-bottom: 4px;">
+        <strong id="lastBackupTitle" style="font-size: 14px;">⏱ 上次備份</strong>
+        <span id="lastBackupPill" class="pill neutral">讀取中…</span>
       </div>
-      <div id="saveResult" style="margin-top:10px; font-size:14px;" aria-live="polite"></div>
+      <div id="lastBackupDetail" class="hint" style="white-space: pre-line; margin-top: 8px;"></div>
     </section>
 
+    <!-- 步驟 1：連線 -->
     <section class="card">
-      <h2>2. 選取要備份的資料</h2>
+      <div class="card-header">
+        <h2>1. Google Drive 連線</h2>
+        <span id="connection" class="pill warn">尚未連線</span>
+      </div>
       
-      <label class="picker">
-        <strong>📷 照片與影片</strong>
-        <span class="sub">可多選；系統會讀取拍攝時間（照片讀 EXIF，影片或無 EXIF 者用檔案時間），分類到「年份/月份」資料夾。</span>
+      <details class="accordion" style="margin-bottom: 16px;">
+        <summary>💡 為什麼需要連線？</summary>
+        <div class="details-content">
+          登入後，本頁只取得暫時存取權杖；不會把權杖儲存在本機。連線時只要求 Drive 權限，匯出聯絡人或行事曆時才會在你勾選當下另外請求唯讀授權。
+        </div>
+      </details>
+
+      <label for="clientId" class="hint" style="display: block; margin-bottom: 6px;">Google OAuth 2.0 用戶端 ID</label>
+      <input id="clientId" type="text" placeholder="請貼上 xxxx.apps.googleusercontent.com" autocomplete="off" autocapitalize="none" spellcheck="false">
+      
+      <div class="row" style="margin-top: 12px;">
+        <button id="saveClient" class="secondary" style="flex: 1;">儲存 ID</button>
+        <button id="connect" style="flex: 1.5;">連線 Google</button>
+        <button id="disconnect" class="secondary" disabled>清除</button>
+      </div>
+      <div id="saveResult" class="hint" style="margin-top: 8px;" aria-live="polite"></div>
+    </section>
+
+    <!-- 步驟 2：選取 -->
+    <section class="card">
+      <div class="card-header">
+        <h2>2. 選取要備份的資料</h2>
+      </div>
+      
+      <label class="picker-box">
+        <div>
+          <strong>📷 照片與影片</strong>
+          <span>讀取 EXIF 時間，自動分類至年份/月份資料夾</span>
+        </div>
+        <div style="font-size: 24px;">➕</div>
         <input id="mediaPicker" type="file" accept="image/*,video/*" multiple>
       </label>
-      <div id="exifrWarn" class="warnbox" role="alert" hidden>⚠️ EXIF 解析套件沒有載入成功。照片會改用「檔案修改時間」分類，可能被放到錯誤的年月或「未分類照片」。請重新整理頁面；若持續發生，請檢查部署是否包含 exifr.full.umd.js。</div>
       
-      <div class="info-box">
-        <p class="hint" style="margin:0 0 8px 0; font-weight:bold; color:var(--ink);">匯出 Google 帳號資料</p>
-        <p class="hint" style="margin:0 0 10px 0;">勾選後，系統會自動向 Google 取得資料，並打包成通用備份檔（.vcf 與 .ics），存入雲端「其他檔案」資料夾，檔名會帶日期時間，每次都是新的一份。僅限 Google 帳號內的聯絡人與行事曆；iPhone 本機或 iCloud 的聯絡人與行事曆，請用下方「📱 iPhone 本機」區塊。</p>
-        
-        <label style="display:flex; align-items:center; gap:8px; padding:10px; background:white; border:1px solid #dce3e9; border-radius:8px; margin-bottom:8px; cursor:pointer;">
-          <input type="checkbox" id="includeContacts" style="width:20px; height:20px; margin:0;">
-          <strong>👤 匯出 Google 聯絡人 (.vcf)</strong>
-        </label>
-        <label style="display:flex; align-items:center; gap:8px; padding:10px; background:white; border:1px solid #dce3e9; border-radius:8px; cursor:pointer;">
-          <input type="checkbox" id="includeCalendar" style="width:20px; height:20px; margin:0;">
-          <strong>📅 匯出 Google 行事曆 (.ics)</strong>
-        </label>
-        <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
-          <label for="calendarRange" class="hint" style="margin:0; white-space:nowrap;">行事曆範圍</label>
-          <select id="calendarRange" style="flex:1; min-height:40px; border:1px solid #bcc9d4; border-radius:10px; padding:6px; font-size:14px; background:white;">
+      <label class="picker-box">
+        <div>
+          <strong>📁 文件與其他檔案</strong>
+          <span>從「檔案」App 選取，統一存入「其他檔案」</span>
+        </div>
+        <div style="font-size: 24px;">➕</div>
+        <input id="docPicker" type="file" multiple>
+      </label>
+
+      <div id="exifrWarn" class="alert alert-warning" role="alert" hidden>
+        ⚠️ EXIF 解析套件未載入，照片將改用「檔案修改時間」分類。請重新整理頁面。
+      </div>
+
+      <!-- 進階匯出折疊區 -->
+      <details class="accordion" id="pimBox">
+        <summary>📇 進階資料匯出 (Google / iPhone 聯絡人與行事曆)</summary>
+        <div class="details-content">
+          <p style="margin-top:0;">僅限 Google 帳號內的聯絡人與行事曆。iPhone 本機資料請先匯出成 .vcf／.ics 檔案再選取。</p>
+          
+          <label style="display:flex; align-items:center; gap:8px; padding:10px; background:white; border:1px solid var(--line); border-radius:8px; margin-bottom:8px; cursor:pointer;">
+            <input type="checkbox" id="includeContacts" style="width:20px; height:20px; margin:0;">
+            <strong>👤 匯出 Google 聯絡人 (.vcf)</strong>
+          </label>
+          <label style="display:flex; align-items:center; gap:8px; padding:10px; background:white; border:1px solid var(--line); border-radius:8px; cursor:pointer; margin-bottom:12px;">
+            <input type="checkbox" id="includeCalendar" style="width:20px; height:20px; margin:0;">
+            <strong>📅 匯出 Google 行事曆 (.ics)</strong>
+          </label>
+          
+          <label for="calendarRange" class="hint" style="margin: 0 0 4px 0;">行事曆範圍</label>
+          <select id="calendarRange" style="margin-bottom: 16px;">
             <option value="1">過去 1 年＋未來 2 年</option>
             <option value="3">過去 3 年＋未來 2 年</option>
             <option value="all">全部（2000 年起）＋未來 2 年</option>
           </select>
-        </div>
-      </div>
 
-      <div class="info-box" id="pimBox">
-        <p class="hint" style="margin:0 0 6px 0; font-weight:bold; color:var(--ink);">📱 iPhone 本機／iCloud 聯絡人與行事曆（從「檔案」App 選取）</p>
-        <p class="hint" style="margin:0 0 8px 0;">網頁讀不到 iPhone 本機的通訊錄與行事曆。請先在 iPhone 把它們匯出成 .vcf／.ics 檔案存進「檔案」App，再從這裡選取；可以和上面的 Google 匯出同時使用。每次備份都會加上日期時間，不會覆蓋舊的備份。</p>
-        <details>
-          <summary>📖 怎麼匯出成 .vcf／.ics？</summary>
-          <div class="hint">
-            <strong>聯絡人（.vcf）</strong>
-            <ol class="steps">
-              <li>打開「通訊錄」App，進入清單畫面。</li>
-              <li>按住頂端的「所有聯絡人」（或你要備份的群組），點「匯出」。</li>
-              <li>點「選取所有欄位」，再按右上角勾選。</li>
-              <li>在分享選單點「儲存到檔案」，選一個資料夾（例如「在我的 iPhone 上」）。</li>
-              <li>回到這裡，按下方「選擇聯絡人檔」，從「檔案」App 選剛存的 .vcf。</li>
-            </ol>
-            <p style="margin:2px 0 8px 0;">若你的 iOS 沒有「匯出」選項：用 Safari 開 icloud.com 的「通訊錄」，全選後從左下角的設定選單匯出 vCard，再存到「檔案」。（選單名稱可能因版本略有不同。）</p>
-            <strong>行事曆（.ics）</strong>
-            <ol class="steps">
-              <li>iPhone 內建的「行事曆」App 沒有「匯出整個行事曆」的功能。</li>
-              <li>最簡單：如果行事曆同步到 Google 行事曆，直接用上方的「匯出 Google 行事曆」。</li>
-              <li>iCloud／其他行事曆：用 Mac 的「行事曆」App，點選行事曆名稱，選「檔案 → 輸出 → 輸出…」存成 .ics，再用 AirDrop 或 iCloud 雲碟放到 iPhone 的「檔案」。</li>
-              <li>回到這裡，按下方「選擇行事曆檔」，選那個 .ics。</li>
-            </ol>
+          <div style="background: white; border: 1px dashed var(--line); border-radius: 8px; padding: 12px;">
+            <p style="margin:0 0 8px 0; font-weight:bold; color:var(--ink);">📱 iPhone 本機檔案</p>
+            <label class="picker-box" style="margin-bottom: 8px; padding: 10px;">
+              <div><strong>👤 選擇聯絡人檔 (.vcf)</strong></div>
+              <input id="vcfPicker" type="file" accept=".vcf,text/vcard,text/x-vcard,text/directory" multiple>
+            </label>
+            <label class="picker-box" style="padding: 10px; margin-bottom: 0;">
+              <div><strong>📅 選擇行事曆檔 (.ics)</strong></div>
+              <input id="icsPicker" type="file" accept=".ics,text/calendar" multiple>
+            </label>
+            <ul id="pimList" style="margin-top: 8px;"></ul>
+            <div id="pimMsg" class="hint" aria-live="polite" style="white-space:pre-line; margin-top: 8px;"></div>
           </div>
-        </details>
-        <label class="picker">
-          <strong>👤 選擇聯絡人檔 (.vcf)</strong>
-          <input id="vcfPicker" type="file" accept=".vcf,text/vcard,text/x-vcard,text/directory" multiple>
-        </label>
-        <label class="picker">
-          <strong>📅 選擇行事曆檔 (.ics)</strong>
-          <input id="icsPicker" type="file" accept=".ics,text/calendar" multiple>
-        </label>
-        <ul id="pimList"></ul>
-        <div id="pimMsg" class="hint" aria-live="polite" style="white-space:pre-line;"></div>
-      </div>
+        </div>
+      </details>
 
-      <label class="picker">
-        <strong>📁 文件與其他檔案</strong>
-        <span class="sub">從 iPhone「檔案」App 選取；可多選。上傳後會存入「其他檔案」資料夾。</span>
-        <input id="docPicker" type="file" multiple>
-      </label>
-      
-      <div class="row">
-        <button id="clearSelection" class="secondary">清除選取清單</button>
-        <span id="selectionCount" class="pill">尚未選取檔案</span>
+      <!-- 已選清單 -->
+      <div style="margin-top: 20px; padding-top: 16px; border-top: 1px dashed var(--line);">
+        <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
+          <span id="selectionCount" class="pill neutral">尚未選取檔案</span>
+          <button id="clearSelection" class="secondary btn-small" type="button">清除選取</button>
+        </div>
+        <div id="ledgerHint" class="hint" style="margin-top:8px;" hidden></div>
+        <button id="pruneBackedUp" class="secondary full btn-small" type="button" style="margin-top:8px;" hidden>從清單移除已備份的檔案</button>
+        <ul id="fileList" style="margin-top:10px;"></ul>
       </div>
-      <div id="ledgerHint" class="hint" style="margin-top:8px;" hidden></div>
-      <button id="pruneBackedUp" class="secondary full" type="button" style="margin-top:8px;" hidden>從清單移除已備份的檔案（先向 Drive 驗證）</button>
-      <ul id="fileList" style="margin-top:10px"></ul>
     </section>
 
+    <!-- 步驟 3：執行 -->
     <section class="card">
-      <div class="status"><h2>3. 執行備份</h2><span id="uploadState" class="pill">待命</span></div>
-      <p class="sub">開始前會先檢查 Google 雲端剩餘空間；上傳前會檢查雲端是否已有「同名且大小相同」的檔案，避免重複佔用空間；同名但內容不同的會自動改名保留。單檔上傳失敗時系統會自動重試，仍失敗的檔案可事後按「只重試」。備份期間會保持螢幕亮起。</p>
-      <div style="margin:10px 0;">
-        <label for="verifyMode" class="sub">備份後驗證</label>
-        <select id="verifyMode" class="full" style="width:100%;">
-          <option value="md5-100">檔案大小＋MD5 比對（只驗證 100 MB 以下的檔案）</option>
-          <option value="md5-all">檔案大小＋MD5 比對（全部檔案，大檔較慢）</option>
-          <option value="size">只比對檔案大小（最快）</option>
-        </select>
-        <div class="hint" style="margin-top:4px;">上傳完成後，在手機上算出檔案的 MD5，和 Google Drive 回傳的 <code>md5Checksum</code> 比對；不符的檔案會被移到雲端垃圾桶並自動重傳。</div>
+      <div class="card-header">
+        <h2>3. 執行備份</h2>
+        <span id="uploadState" class="pill neutral">待命</span>
       </div>
-      <button id="backup" class="full" disabled>備份所選資料到 Google Drive</button>
-      <button id="cancelBackup" class="secondary full" type="button" style="margin-top:8px;" hidden>取消備份</button>
-      <button id="retryFailed" class="secondary full" type="button" style="margin-top:8px;" hidden>只重試失敗／未完成的檔案</button>
-      <div id="wakeNote" class="hint" style="margin-top:8px;" aria-live="polite"></div>
-      <div id="reauthBox" hidden style="margin-top:10px; padding:12px; border:1px solid #f0c36d; background:#fff8e6; border-radius:10px;">
-        <p id="reauthMsg" class="hint" style="margin:0 0 8px 0; color:var(--ink);">Google 授權已過期，請重新授權後繼續。</p>
-        <div class="row">
-          <button id="reauthBtn">重新授權並繼續</button>
-          <button id="reauthCancel" class="secondary">放棄本次備份</button>
+
+      <div id="reauthBox" class="alert alert-warning" hidden>
+        <div style="flex:1;">
+          <p id="reauthMsg" style="margin:0 0 8px 0; font-weight:600;">授權已過期，請重新授權後繼續。</p>
+          <div class="row">
+            <button id="reauthBtn" class="btn-small">重新授權並繼續</button>
+            <button id="reauthCancel" class="secondary btn-small">放棄本次備份</button>
+          </div>
         </div>
       </div>
-      <progress id="progress" max="100" value="0" hidden></progress>
-      <div id="progressText" class="hint" aria-live="polite"></div>
-      <div id="result" style="margin-top:10px" aria-live="polite"></div>
+
+      <details class="accordion">
+        <summary>⚙️ 進階備份設定</summary>
+        <div class="details-content">
+          <label for="verifyMode" class="hint" style="display:block; margin-bottom:4px; font-weight:600;">上傳後驗證方式</label>
+          <select id="verifyMode">
+            <option value="md5-100">檔案大小＋MD5 比對（僅 100 MB 以下）</option>
+            <option value="md5-all">檔案大小＋MD5 比對（全部，較慢）</option>
+            <option value="size">只比對檔案大小（最快）</option>
+          </select>
+          <p style="margin:0;">MD5 不符的檔案會被移到雲端垃圾桶並自動重傳。</p>
+        </div>
+      </details>
+
+      <button id="backup" class="full" disabled style="padding: 16px; font-size: 16px; border-radius: 12px; margin-top: 8px;">🚀 備份所選資料</button>
+      <button id="cancelBackup" class="secondary full" type="button" style="margin-top:10px;" hidden>取消備份</button>
+      <button id="retryFailed" class="secondary full" type="button" style="margin-top:10px;" hidden>只重試失敗／未完成的檔案</button>
       
-      <div style="margin-top:20px; border-top:1px solid #edf0f3; padding-top:15px;">
-        <div class="status"><h3 style="font-size:15px; margin:0; color:var(--ink);">📜 備份紀錄</h3><span id="historyCount" class="pill">0 次</span></div>
-        <p class="hint" style="margin:6px 0 8px 0;">每次備份的逐檔結果都存在這台裝置（最多保留最近 50 次），點開可看每個檔案。紀錄只在本機，可匯出成 CSV／JSON 留存。</p>
-        <div class="row" style="margin-bottom:8px;">
-          <button id="histExportCsv" class="secondary btn-small" type="button">匯出全部 CSV</button>
-          <button id="histExportJson" class="secondary btn-small" type="button">匯出全部 JSON</button>
-          <button id="histClear" class="secondary btn-small" type="button">清除紀錄</button>
-        </div>
-        <div id="histMsg" class="hint" aria-live="polite"></div>
-        <ul id="historyList" style="font-size:13px; color:var(--muted);">
-          <li>尚無備份紀錄</li>
-        </ul>
+      <div id="wakeNote" class="hint" style="margin-top:10px; text-align: center;" aria-live="polite"></div>
+      
+      <div style="margin-top: 16px;">
+        <progress id="progress" max="100" value="0" hidden></progress>
+        <div id="progressText" class="hint" aria-live="polite" style="text-align: center;"></div>
+        <div id="result" class="hint" style="margin-top:10px; white-space: pre-wrap;" aria-live="polite"></div>
       </div>
+    </section>
+
+    <!-- 備份紀錄 (移到底部並可折疊) -->
+    <section class="card" style="padding: 16px;">
+      <details class="accordion" style="margin-bottom: 0; border: none; background: transparent;">
+        <summary style="padding: 0; color: var(--muted);">
+          <span>📜 查看備份紀錄 (<span id="historyCount">0</span>)</span>
+        </summary>
+        <div class="details-content" style="padding-top: 12px; border-top: none;">
+          <div class="row" style="margin-bottom:12px;">
+            <button id="histExportCsv" class="secondary btn-small" type="button">匯出 CSV</button>
+            <button id="histExportJson" class="secondary btn-small" type="button">匯出 JSON</button>
+            <button id="histClear" class="secondary btn-small" type="button">清除紀錄</button>
+          </div>
+          <div id="histMsg" class="hint" aria-live="polite"></div>
+          <ul id="historyList">
+            <li class="hint">尚無備份紀錄</li>
+          </ul>
+        </div>
+      </details>
     </section>
   </div>
 
   <!-- Tab 2: 雲端還原 -->
   <div id="tab-cloud" class="tab-content">
     <section class="card">
-      <div class="status">
+      <div class="card-header">
         <h2>☁️ 雲端檔案瀏覽器</h2>
-        <button id="loadCloudFiles" class="secondary" style="min-height:32px; padding:6px 12px; font-size:13px;">重新整理</button>
+        <button id="loadCloudFiles" class="secondary btn-small">重新整理</button>
       </div>
-      <p class="hint" style="margin-bottom:12px;">點藍色資料夾進入。單一檔案可直接下載；整批請用下方的「ZIP 串流」或「存到相簿」。<br><br>💡 <b>在主畫面 App 模式下</b>：單一檔案會自動改用「分享面板」讓你直接存到檔案或相簿，不會卡住。若要下載大批次 ZIP，建議改用 Safari 分頁開啟本網頁。</p>
 
-      <div id="folderBreadcrumb" style="margin-bottom:10px; font-size:12px; color:var(--muted);"></div>
-
-      <div id="batchActionBar" hidden style="margin-bottom:10px;">
-        <div class="row" style="margin-bottom:8px;">
-          <label class="check"><input type="checkbox" id="cloudSelectAll"> 全選已載入的檔案</label>
-          <span id="cloudSelCount" class="pill">未選取</span>
-        </div>
-        <label class="check" style="margin-bottom:8px;"><input type="checkbox" id="cloudRecursive" checked> 沒勾選檔案時，一併包含所有子資料夾</label>
-        <button id="btnZip" class="full" type="button" style="margin-bottom:8px;">⬇️ 下載成 ZIP（串流，不佔記憶體）</button>
-        <button id="btnShare" class="secondary full" type="button">📲 存到相簿（開啟分享表單）</button>
-        <p class="hint" style="margin:8px 0 0 0;">有勾選就只處理勾選的檔案，沒勾選就處理整個資料夾。ZIP 會存到「檔案」App 的下載位置；要放進「照片」請用「存到相簿」，系統會分批跳出分享表單，請依序點「儲存影像／儲存影片」。</p>
-      </div>
+      <div id="folderBreadcrumb" class="hint" style="margin-bottom:12px; font-weight:600;"></div>
 
       <div id="cloudOp" class="opbox" hidden role="status" aria-live="polite">
-        <div id="cloudOpMsg" class="hint" style="color:var(--ink); white-space:pre-line;"></div>
+        <div id="cloudOpMsg" class="hint" style="color:var(--ink); white-space:pre-line; font-weight:600;"></div>
         <div id="cloudWakeNote" class="hint"></div>
-        <div id="cloudIosNote" class="hint warn-text" style="white-space:pre-line;" hidden></div>
+        <div id="cloudIosNote" class="hint warn-text" style="white-space:pre-line; margin-top:8px; display:none;"></div>
         <progress id="cloudOpProgress" max="100" value="0"></progress>
-        <div class="row">
-          <button id="cloudOpTap" type="button" hidden></button>
-          <button id="cloudOpCancel" class="secondary" type="button">取消</button>
+        <div class="row" style="justify-content: flex-end;">
+          <button id="cloudOpTap" type="button" hidden class="btn-small"></button>
+          <button id="cloudOpCancel" class="secondary btn-small" type="button">取消</button>
         </div>
       </div>
 
-      <ul id="cloudFileList" style="font-size:13px; color:var(--muted); max-height: 460px; overflow-y: auto;">
-        <li>請先連線 Google 並點擊「重新整理」載入清單。</li>
+      <div id="batchActionBar" hidden style="margin-bottom:16px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <label style="display:flex; align-items:center; gap:6px; font-size:14px; cursor:pointer;">
+            <input type="checkbox" id="cloudSelectAll" style="width:18px; height:18px; margin:0;"> 全選
+          </label>
+          <span id="cloudSelCount" class="pill neutral">未選取</span>
+        </div>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); margin-bottom: 12px; cursor:pointer;">
+          <input type="checkbox" id="cloudRecursive" checked style="margin:0;"> 未勾選檔案時，包含子資料夾
+        </label>
+        <div class="row">
+          <button id="btnZip" class="full" type="button" style="flex:1;">⬇️ 下載成 ZIP (串流)</button>
+          <button id="btnShare" class="secondary full" type="button" style="flex:1;">📲 存到相簿</button>
+        </div>
+      </div>
+
+      <ul id="cloudFileList" style="max-height: 50vh; overflow-y: auto;">
+        <li class="hint">請先連線 Google 並點擊「重新整理」載入清單。</li>
       </ul>
-      <button id="cloudMore" class="secondary full" type="button" hidden style="margin-top:8px;">載入更多</button>
+      
+      <button id="cloudMore" class="secondary full" type="button" hidden style="margin-top:12px;">載入更多</button>
     </section>
   </div>
 
   <!-- Tab 3: 設定與說明 -->
   <div id="tab-settings" class="tab-content">
+    
+    <!-- 設定區 -->
     <section class="card">
-      <h2>📖 備份檔還原指南</h2>
-      <p class="hint" style="margin-bottom:12px;">如果你下載了聯絡人或行事曆備份檔，請依照以下步驟還原至 iPhone：</p>
-      
-      <details open>
-        <summary>👤 如何還原 Google 聯絡人 (.vcf)</summary>
-        <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
-          1. 在「雲端還原」頁籤下載 <code>Google_Contacts_日期時間.vcf</code>。<br>
-          2. 打開 iPhone 的「檔案」App，找到該檔案並點擊。<br>
-          3. iOS 會跳出聯絡人預覽，點擊「新增所有聯絡人」即可匯入。若手機裡已有相同聯絡人，可能會出現重複，建議先確認再匯入。
-        </div>
-      </details>
-      
-      <details>
-        <summary>📅 如何還原 Google 行事曆 (.ics)</summary>
-        <div style="padding:8px 0; font-size:13px; color:var(--muted); line-height:1.6;">
-          1. 在「雲端還原」頁籤下載 <code>Google_Calendar_日期時間.ics</code>。<br>
-          2. 打開「檔案」App，點擊該檔案。<br>
-          3. 在跳出的選單中點擊「行事曆」，選擇要加入的行事曆後確認即可。
-        </div>
-      </details>
-    </section>
-
-    <section class="card">
-      <h2>⏰ 備份提醒</h2>
-      <label for="remindDays" class="sub">超過幾天沒有備份就提醒我</label>
-      <select id="remindDays" style="width:100%; margin-top:6px;">
+      <div class="card-header"><h2>⏰ 備份提醒</h2></div>
+      <label for="remindDays" class="hint" style="display:block; margin-bottom:8px;">超過幾天沒有備份就提醒我：</label>
+      <select id="remindDays">
         <option value="0">不提醒</option>
         <option value="3">3 天</option>
         <option value="7">7 天</option>
         <option value="14">14 天</option>
         <option value="30">30 天</option>
       </select>
-      <p class="hint" style="margin-top:8px;">網頁 App 無法在背景發送通知，所以提醒會顯示在「備份資料」頁最上方，每次打開 App 都會看到「上次備份」是什麼時候。</p>
     </section>
 
     <section class="card">
-      <h2>🗂️ 本機備份帳本</h2>
-      <p class="hint" style="margin-bottom:10px;">記錄這台裝置已備份過哪些檔案（檔名、大小、修改時間，以及對應的 Drive 檔案 ID），只存在本機瀏覽器，不會上傳。重複選取同一批照片時，已備份的會先跳過；跳過之前一定會向 Drive 驗證檔案仍在，所以帳本遺失或過時只會變慢，不會漏備份。</p>
-      <div id="ledgerStats" class="info-box hint">讀取中…</div>
+      <div class="card-header"><h2>🗂️ 本機備份帳本</h2></div>
+      <p class="hint" style="margin-top:0;">記錄已備份檔案的指紋，重複選取時自動跳過。僅存在本機。</p>
+      <div id="ledgerStats" class="alert alert-info">讀取中…</div>
       <div class="row">
         <button id="ledgerSync" class="secondary" type="button" disabled>與 Drive 同步驗證</button>
         <button id="ledgerClear" class="secondary" type="button">清除本機帳本</button>
@@ -342,18 +407,35 @@
       <div id="ledgerMsg" class="hint" aria-live="polite" style="margin-top:8px;"></div>
     </section>
 
+    <!-- 說明折疊區 -->
     <section class="card">
-      <h2>🛡️ 安全與隱私說明</h2>
-      <ul style="padding-left:18px; list-style:disc; margin-top:10px; line-height:1.6; font-size:13px; color:var(--muted);">
-        <li>連線時只要求 Google 的 <code>drive.file</code> 權限，僅能存取「由本工具建立」的檔案，無法讀取您雲端硬碟的其他資料。</li>
-        <li>聯絡人與行事曆是「唯讀」權限，只在您勾選匯出的當下才會請求；資料只用來在您的手機上產生備份檔，並上傳到您自己的 Drive，不會傳到其他地方。</li>
-        <li>授權金鑰（Access Token）只暫存在瀏覽器記憶體中，約 1 小時後失效，重新整理網頁也會清除。EXIF 解析套件（exifr 7.1.3）已隨本站一起部署，不從第三方網站載入；唯一的外部腳本是 Google 登入元件。本頁並設有內容安全政策（CSP），限制可載入的腳本與可連線的網址。</li>
-        <li>長時間備份時授權可能過期：本頁會先嘗試自動續期，失敗時會暫停並顯示「重新授權並繼續」，授權後從原本的檔案接著做。</li>
-        <li>此裝置的瀏覽器會儲存：用戶端 ID、備份根資料夾 ID、提醒與驗證設定、最近 50 次備份的逐檔紀錄（含檔名、大小、結果與 Drive 檔案 ID，存在 IndexedDB），以及「本機備份帳本」——記錄已備份檔案的檔名、大小、修改時間與對應的 Drive 檔案 ID（用來跳過已備份的檔案）。帳本與備份紀錄只存在本機，不會上傳，可在「設定」頁與「備份紀錄」清除；不會儲存授權金鑰。</li>
-        <li>雲端還原的串流下載：Drive 的下載請求仍由本頁發出（授權金鑰不會交給 Service Worker），資料以小段傳給 Service Worker 再交給 iOS 寫入下載位置，大影片不會整個放進記憶體。若你的環境不支援串流，會自動改成「分批 ZIP」，每份約 200 MB，逐份點擊下載。</li>
-        <li>請勿在公用電腦上儲存您的 Client ID，或在公共場所進行大量備份。</li>
-        <li>備份期間本頁會要求螢幕保持亮起（需要 iOS 16.4 以上；若顯示無法啟用，請手動保持亮起）。切換 App 或鎖定螢幕時 iOS 仍可能中斷上傳，中斷的檔案可按「只重試失敗／未完成的檔案」。</li>
-      </ul>
+      <div class="card-header"><h2>📖 還原與隱私說明</h2></div>
+      
+      <details class="accordion">
+        <summary>👤 如何還原聯絡人 (.vcf)</summary>
+        <div class="details-content">
+          在「雲端還原」頁下載 <code>.vcf</code> 檔 → 打開「檔案」App 點擊該檔案 → 點擊「新增所有聯絡人」。
+        </div>
+      </details>
+
+      <details class="accordion">
+        <summary>📅 如何還原行事曆 (.ics)</summary>
+        <div class="details-content">
+          在「雲端還原」頁下載 <code>.ics</code> 檔 → 打開「檔案」App 點擊該檔案 → 選擇要加入的行事曆後確認。
+        </div>
+      </details>
+
+      <details class="accordion">
+        <summary>🛡️ 安全與隱私說明</summary>
+        <div class="details-content">
+          <ul style="padding-left: 16px; margin: 0;">
+            <li style="margin-bottom: 8px;">僅要求 <code>drive.file</code> 權限，無法讀取您硬碟的其他資料。聯絡人與行事曆為唯讀權限。</li>
+            <li style="margin-bottom: 8px;">授權金鑰僅暫存於記憶體（及本機 localStorage 供重開恢復），約 1 小時失效。</li>
+            <li style="margin-bottom: 8px;">本機儲存空間（IndexedDB）用於保存備份帳本與歷史紀錄，不會上傳。</li>
+            <li>雲端還原的串流下載由 Service Worker 處理，大影片不會佔用大量記憶體。</li>
+          </ul>
+        </div>
+      </details>
     </section>
   </div>
 
