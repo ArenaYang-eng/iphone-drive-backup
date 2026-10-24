@@ -1,7 +1,7 @@
 (() => {
   const APP_VERSION = 'v3.9';
   const $ = id => document.getElementById(id);
-
+  
   const verEl = $('versionDisplay');
   if (verEl) verEl.textContent = APP_VERSION;
 
@@ -10,23 +10,28 @@
   let selectedFiles = [];
   let folderHistory = [];
   let uploading = false;
-  let currentFolderFiles = [];
-  let cancelRequested = false;
-  let currentXhr = null;
-  let failedJobs = [];
+  // 備份流程狀態
+  let cancelRequested = false;  // 使用者按了「取消備份」
+  let currentXhr = null;        // 進行中的上傳；取消時 abort()
+  let failedJobs = [];          // 失敗＋未處理的 File，供「只重試」使用
   let wakeLock = null;
   let hiddenDuringUpload = false;
   let exifrMissingCount = 0;
   let swReg = null;
-  let syncUpdateBar = () => {};
-  let ledgerAcct = null;
+  let syncUpdateBar = () => {}; // 由 initServiceWorker() 接手
+  // 本機備份帳本（IndexedDB）狀態
+  let ledgerAcct = null;          // 目前 Google 帳號的 permissionId；null = 尚未取得，帳本暫停使用
   let ledgerAcctPromise = null;
-  let ledgerEpoch = 0;
+  let ledgerEpoch = 0;            // 斷線／換帳號時 +1，避免舊的非同步結果寫進新狀態
   let ledgerDbPromise = null;
-  let ledgerBusy = false;
-  const ledgerKeys = new Set();
-  let lastBackupStartedAt = 0;
-  let historyDetailOpen = false;
+  let ledgerBusy = false;         // 帳本維護（驗證／清除）進行中：暫停備份按鈕
+  const ledgerKeys = new Set();   // 目前帳號的帳本鍵（記憶體副本，用來在選取清單標示「已備份」）
+  // 備份後驗證模式：'size' 只比對大小｜'md5-100' 另加 MD5（100MB 以下）｜'md5-all' 另加 MD5（全部）
+  const VERIFY_KEY = 'iphoneBackupVerifyMode';
+  const VERIFY_MAX_BYTES = 100 * 1024 * 1024;
+  let verifyMode = 'md5-100';
+  try { const v = localStorage.getItem(VERIFY_KEY); if (['size', 'md5-100', 'md5-all'].includes(v)) verifyMode = v; } catch (e) { /* 讀不到就用預設 */ }
+
 
   const savedClientId = localStorage.getItem('iphoneDriveBackupClientId') || '';
   if ($('clientId')) $('clientId').value = savedClientId;
@@ -48,14 +53,16 @@
     if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(1) + ' MB';
     return (bytes/1024/1024/1024).toFixed(2) + ' GB';
   }
-
+  
   function showResult(message, type='') {
     if ($('result')) { $('result').className = type; $('result').textContent = message; }
   }
 
   function refreshSelection() {
     if (!$('selectionCount')) return;
-    $('selectionCount').textContent = selectedFiles.length ? `${selectedFiles.length} 個檔案` : '尚未選取檔案';
+    const pimN = typeof pimFiles !== 'undefined' ? pimFiles.length : 0;
+    const totalN = selectedFiles.length + pimN;
+    $('selectionCount').textContent = totalN ? `${totalN} 個檔案` : '尚未選取檔案';
     $('fileList').replaceChildren();
     selectedFiles.forEach((file, index) => {
       const li = document.createElement('li'); li.className = 'file';
@@ -70,7 +77,7 @@
       $('ledgerHint').textContent = ledgerHits ? `${ledgerHits} 個檔案先前已備份過（依本機帳本）。備份時會先向 Google Drive 驗證檔案仍在，驗證通過就直接跳過。` : '';
     }
     if ($('pruneBackedUp')) $('pruneBackedUp').hidden = !(ledgerHits && accessToken && !uploading && !ledgerBusy);
-    $('backup').disabled = !accessToken || (!selectedFiles.length && !$('includeContacts').checked && !$('includeCalendar').checked) || uploading || ledgerBusy;
+    $('backup').disabled = !accessToken || (!totalN && !$('includeContacts').checked && !$('includeCalendar').checked) || uploading || ledgerBusy;
   }
 
   function addFiles(list) {
@@ -82,323 +89,7 @@
     refreshSelection();
   }
 
-  // ===== 新增：備份紀錄（IndexedDB）=====
-  const HISTORY_DB = 'iphoneBackupHistory';
-  const HISTORY_STORE = 'runs';
-  let historyDbPromise = null;
-
-  function openHistoryDb() {
-    if (!historyDbPromise) {
-      historyDbPromise = new Promise((resolve, reject) => {
-        if (!window.indexedDB) return reject(new Error('此瀏覽器不支援 IndexedDB'));
-        const req = indexedDB.open(HISTORY_DB, 1);
-        req.onupgradeneeded = () => {
-          const db = req.result;
-          if (!db.objectStoreNames.contains(HISTORY_STORE)) {
-            const st = db.createObjectStore(HISTORY_STORE, { keyPath: 'id' });
-            st.createIndex('endedAt', 'endedAt');
-          }
-        };
-        req.onsuccess = () => { const db = req.result; db.onversionchange = () => db.close(); resolve(db); };
-        req.onerror = () => reject(req.error || new Error('無法開啟備份紀錄資料庫'));
-      });
-      historyDbPromise.catch(() => { historyDbPromise = null; });
-    }
-    return historyDbPromise;
-  }
-
-  async function saveBackupRun(run) {
-    try {
-      const db = await openHistoryDb();
-      const tx = db.transaction(HISTORY_STORE, 'readwrite');
-      tx.objectStore(HISTORY_STORE).put(run);
-      await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
-      const all = await listBackupRuns(200);
-      if (all.length > 50) {
-        const tx2 = db.transaction(HISTORY_STORE, 'readwrite');
-        const st = tx2.objectStore(HISTORY_STORE);
-        all.slice(50).forEach(r => st.delete(r.id));
-        await new Promise((res, rej) => { tx2.oncomplete = res; tx2.onerror = () => rej(tx2.error); });
-      }
-    } catch (e) { console.warn('儲存備份紀錄失敗:', e); }
-  }
-
-  async function listBackupRuns(limit = 50) {
-    try {
-      const db = await openHistoryDb();
-      const tx = db.transaction(HISTORY_STORE, 'readonly');
-      const st = tx.objectStore(HISTORY_STORE);
-      const idx = st.index('endedAt');
-      const req = idx.openCursor(null, 'prev');
-      const out = [];
-      await new Promise((resolve, reject) => {
-        req.onsuccess = () => {
-          const cursor = req.result;
-          if (cursor && out.length < limit) { out.push(cursor.value); cursor.continue(); }
-          else resolve();
-        };
-        req.onerror = () => reject(req.error);
-      });
-      return out;
-    } catch (e) { console.warn('讀取備份紀錄失敗:', e); return []; }
-  }
-
-  async function clearBackupRuns() {
-    try {
-      const db = await openHistoryDb();
-      const tx = db.transaction(HISTORY_STORE, 'readwrite');
-      tx.objectStore(HISTORY_STORE).clear();
-      await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
-    } catch (e) { console.warn('清除備份紀錄失敗:', e); }
-  }
-
-  function fmtTime(ts) {
-    if (!ts) return '—';
-    const d = new Date(ts);
-    return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
-  }
-
-  async function loadBackupHistory() {
-    const list = $('historyList');
-    if (!list) return;
-    let runs = await listBackupRuns(5);
-    // 若 IndexedDB 沒有資料，退回 localStorage 舊資料（相容）
-    if (!runs.length) {
-      let old = [];
-      try { old = JSON.parse(localStorage.getItem('iphoneBackupHistory') || '[]'); } catch (e) { old = []; }
-      if (Array.isArray(old) && old.length) {
-        list.replaceChildren(...old.map(item => el('li', { class: 'hist-item' },
-          el('strong', { text: String(item.time) }), el('br'),
-          `成功: ${item.success} | 跳過: ${item.skipped} | 失敗: ${item.failures}`)));
-        if ($('lastBackupInfo')) $('lastBackupInfo').textContent = `上次備份（舊版紀錄）：${old[0].time}`;
-        return;
-      }
-      list.replaceChildren(el('li', { text: '尚無備份紀錄' }));
-      if ($('lastBackupInfo')) $('lastBackupInfo').textContent = '尚無備份紀錄';
-      return;
-    }
-    if ($('lastBackupInfo')) {
-      const r = runs[0];
-      $('lastBackupInfo').textContent = `上次備份：${fmtTime(r.endedAt)}｜成功 ${r.success} / 跳過 ${r.skipped} / 失敗 ${r.failures}${r.unprocessed ? ` / 未處理 ${r.unprocessed}` : ''}`;
-    }
-    list.replaceChildren(...runs.map(run => {
-      const li = el('li', { class: 'hist-item' });
-      const head = el('div', null,
-        el('strong', { text: fmtTime(run.endedAt) }),
-        el('br'),
-        `成功: ${run.success} | 帳本跳過: ${run.ledgerSkipped || 0} | 跳過重複: ${(run.skipped || 0) - (run.ledgerSkipped || 0) > 0 ? (run.skipped || 0) - (run.ledgerSkipped || 0) : 0} | 失敗: ${run.failures}${run.unprocessed ? ` | 未處理: ${run.unprocessed}` : ''}`
-      );
-      li.append(head);
-      return li;
-    }));
-    if (historyDetailOpen) renderHistoryDetails();
-  }
-
-  async function renderHistoryDetails() {
-    const box = $('historyDetail');
-    if (!box) return;
-    if (!historyDetailOpen) { box.hidden = true; return; }
-    box.hidden = false;
-    box.replaceChildren(el('div', { text: '載入中…' }));
-    const runs = await listBackupRuns(10);
-    if (!runs.length) { box.replaceChildren(el('div', { text: '尚無詳細紀錄。' })); return; }
-    const parts = [];
-    runs.forEach(run => {
-      const wrap = el('div', { class: 'hist-detail' });
-      wrap.append(el('div', null, el('strong', { text: fmtTime(run.endedAt) }), ' ', el('span', { text: run.stopReason ? `（結束原因：${run.stopReason}）` : '' })));
-      if (run.notes && run.notes.length) wrap.append(el('div', { text: '備註：' + run.notes.join('、') }));
-      (run.files || []).forEach(f => {
-        const cls = f.status === 'success' ? 'ok' : f.status === 'failure' ? 'fail' : 'skip';
-        const label = f.status === 'success' ? '✅' : f.status === 'failure' ? '❌' : f.status === 'skipped' ? '⏭️' : f.status === 'ledger-skipped' ? '📒' : '⏸️';
-        wrap.append(el('div', { class: 'hist-file ' + cls, text: `${label} ${f.name}${f.message ? ' — ' + f.message : ''}${f.md5Verified ? ' （MD5 已驗證）' : ''}` }));
-      });
-      parts.push(wrap);
-    });
-    box.replaceChildren(...parts);
-  }
-
-  async function exportHistoryJson() {
-    const runs = await listBackupRuns(200);
-    if (!runs.length) { showResult('沒有可匯出的紀錄。', 'error'); return; }
-    const blob = new Blob([JSON.stringify(runs, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = `backup-history-${stampTag()}.json`;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
-    showResult(`已匯出 ${runs.length} 筆紀錄。`, 'success');
-  }
-
-  // 保留舊函式以相容（會被 runJobs 同時呼叫）
-  function saveBackupHistory(success, skipped, failures) {
-    try {
-      const history = JSON.parse(localStorage.getItem('iphoneBackupHistory') || '[]');
-      const now = new Date();
-      const timeStr = `${now.getMonth()+1}/${now.getDate()} ${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`;
-      history.unshift({ time: timeStr, success, skipped: skipped.length, failures: failures.length });
-      localStorage.setItem('iphoneBackupHistory', JSON.stringify(history.slice(0, 5)));
-    } catch (e) { /* 忽略 */ }
-  }
-
-  // ===== 新增：MD5（純 JS）=====
-  const md5 = (() => {
-    function safeAdd(x, y) { const l = (x & 0xffff) + (y & 0xffff); return (((x >> 16) + (y >> 16) + (l >> 16)) << 16) | (l & 0xffff); }
-    function rol(n, c) { return (n << c) | (n >>> (32 - c)); }
-    function cmn(q,a,b,x,s,t){return safeAdd(rol(safeAdd(safeAdd(a,q),safeAdd(x,t)),s),b);}
-    function ff(a,b,c,d,x,s,t){return cmn((b&c)|(~b&d),a,b,x,s,t);}
-    function gg(a,b,c,d,x,s,t){return cmn((b&d)|(c&~d),a,b,x,s,t);}
-    function hh(a,b,c,d,x,s,t){return cmn(b^c^d,a,b,x,s,t);}
-    function ii(a,b,c,d,x,s,t){return cmn(c^(b|~d),a,b,x,s,t);}
-    function binl(x, len) {
-      x[len >> 5] |= 0x80 << (len % 32);
-      x[(((len + 64) >>> 9) << 4) + 14] = len;
-      let a=1732584193,b=-271733879,c=-1732584194,d=271733878;
-      for (let i=0;i<x.length;i+=16) {
-        const oa=a,ob=b,oc=c,od=d;
-        a=ff(a,b,c,d,x[i],7,-680876936);d=ff(d,a,b,c,x[i+1],12,-389564586);c=ff(c,d,a,b,x[i+2],17,606105819);b=ff(b,c,d,a,x[i+3],22,-1044525330);
-        a=ff(a,b,c,d,x[i+4],7,-176418897);d=ff(d,a,b,c,x[i+5],12,1200080426);c=ff(c,d,a,b,x[i+6],17,-1473231341);b=ff(b,c,d,a,x[i+7],22,-45705983);
-        a=ff(a,b,c,d,x[i+8],7,1770035416);d=ff(d,a,b,c,x[i+9],12,-1958414417);c=ff(c,d,a,b,x[i+10],17,-42063);b=ff(b,c,d,a,x[i+11],22,-1990404162);
-        a=ff(a,b,c,d,x[i+12],7,1804603682);d=ff(d,a,b,c,x[i+13],12,-40341101);c=ff(c,d,a,b,x[i+14],17,-1502002290);b=ff(b,c,d,a,x[i+15],22,1236535329);
-        a=gg(a,b,c,d,x[i+1],5,-165796510);d=gg(d,a,b,c,x[i+6],9,-1069501632);c=gg(c,d,a,b,x[i+11],14,643717713);b=gg(b,c,d,a,x[i],20,-373897302);
-        a=gg(a,b,c,d,x[i+5],5,-701558691);d=gg(d,a,b,c,x[i+10],9,38016083);c=gg(c,d,a,b,x[i+15],14,-660478335);b=gg(b,c,d,a,x[i+4],20,-405537848);
-        a=gg(a,b,c,d,x[i+9],5,568446438);d=gg(d,a,b,c,x[i+14],9,-1019803690);c=gg(c,d,a,b,x[i+3],14,-187363961);b=gg(b,c,d,a,x[i+8],20,1163531501);
-        a=gg(a,b,c,d,x[i+13],5,-1444681467);d=gg(d,a,b,c,x[i+2],9,-51403784);c=gg(c,d,a,b,x[i+7],14,1735328473);b=gg(b,c,d,a,x[i+12],20,-1926607734);
-        a=hh(a,b,c,d,x[i+5],4,-378558);d=hh(d,a,b,c,x[i+8],11,-2022574463);c=hh(c,d,a,b,x[i+11],16,1839030562);b=hh(b,c,d,a,x[i+14],23,-35309556);
-        a=hh(a,b,c,d,x[i+1],4,-1530992060);d=hh(d,a,b,c,x[i+4],11,1272893353);c=hh(c,d,a,b,x[i+7],16,-155497632);b=hh(b,c,d,a,x[i+10],23,-1094730640);
-        a=hh(a,b,c,d,x[i+13],4,681279174);d=hh(d,a,b,c,x[i],11,-358537222);c=hh(c,d,a,b,x[i+3],16,-722521979);b=hh(b,c,d,a,x[i+6],23,76029189);
-        a=hh(a,b,c,d,x[i+9],4,-640364487);d=hh(d,a,b,c,x[i+12],11,-421815835);c=hh(c,d,a,b,x[i+15],16,530742520);b=hh(b,c,d,a,x[i+2],23,-995338651);
-        a=ii(a,b,c,d,x[i],6,-198630844);d=ii(d,a,b,c,x[i+7],10,1126891415);c=ii(c,d,a,b,x[i+14],15,-1416354905);b=ii(b,c,d,a,x[i+5],21,-57434055);
-        a=ii(a,b,c,d,x[i+12],6,1700485571);d=ii(d,a,b,c,x[i+3],10,-1894986606);c=ii(c,d,a,b,x[i+10],15,-1051523);b=ii(b,c,d,a,x[i+1],21,-2054922799);
-        a=ii(a,b,c,d,x[i+8],6,1873313359);d=ii(d,a,b,c,x[i+15],10,-30611744);c=ii(c,d,a,b,x[i+6],15,-1560198380);b=ii(b,c,d,a,x[i+13],21,1309151649);
-        a=ii(a,b,c,d,x[i+4],6,-145523070);d=ii(d,a,b,c,x[i+11],10,-1120210379);c=ii(c,d,a,b,x[i+2],15,718787259);b=ii(b,c,d,a,x[i+9],21,-343485551);
-        a=safeAdd(a,oa);b=safeAdd(b,ob);c=safeAdd(c,oc);d=safeAdd(d,od);
-      }
-      return [a,b,c,d];
-    }
-    function binl2hex(arr) {
-      let out='';const h='0123456789abcdef';
-      for (let i=0;i<arr.length*4;i++) { const b=(arr[i>>2]>>((i%4)*8))&0xff; out+=h.charAt((b>>4)&0xf)+h.charAt(b&0xf); }
-      return out;
-    }
-    return function md5ArrayBuffer(buf) {
-      const u8 = new Uint8Array(buf);
-      const x = [];
-      const len = u8.length * 8;
-      for (let i = 0; i < u8.length; i++) x[i >> 2] = (x[i >> 2] || 0) | (u8[i] << ((i % 4) * 8));
-      return binl2hex(binl(x, len));
-    };
-  })();
-
-  // ===== 新增：ZIP（STORE，Blob 拼接不複製資料）=====
-  const crcTable = (() => {
-    const t = new Uint32Array(256);
-    for (let i=0;i<256;i++){let c=i;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[i]=c>>>0;}
-    return t;
-  })();
-  function dosDateTime(d = new Date()) {
-    const time = ((d.getHours()&0x1F)<<11)|((d.getMinutes()&0x3F)<<5)|((d.getSeconds()>>1)&0x1F);
-    const date = (((d.getFullYear()-1980)&0x7F)<<9)|(((d.getMonth()+1)&0x0F)<<5)|(d.getDate()&0x1F);
-    return { time, date };
-  }
-  function makeZipLocalHeader(nameBytes, crc, size) {
-    const { time, date } = dosDateTime();
-    const buf = new ArrayBuffer(30 + nameBytes.length);
-    const dv = new DataView(buf);
-    dv.setUint32(0, 0x04034b50, true);
-    dv.setUint16(4, 20, true);
-    dv.setUint16(6, 0x0800, true);
-    dv.setUint16(8, 0, true);
-    dv.setUint16(10, time, true);
-    dv.setUint16(12, date, true);
-    dv.setUint32(14, crc, true);
-    dv.setUint32(18, size, true);
-    dv.setUint32(22, size, true);
-    dv.setUint16(26, nameBytes.length, true);
-    dv.setUint16(28, 0, true);
-    new Uint8Array(buf, 30).set(nameBytes);
-    return new Uint8Array(buf);
-  }
-  function makeZipCentralHeader(nameBytes, crc, size, offset) {
-    const { time, date } = dosDateTime();
-    const buf = new ArrayBuffer(46 + nameBytes.length);
-    const dv = new DataView(buf);
-    dv.setUint32(0, 0x02014b50, true);
-    dv.setUint16(4, 20, true);
-    dv.setUint16(6, 20, true);
-    dv.setUint16(8, 0x0800, true);
-    dv.setUint16(10, 0, true);
-    dv.setUint16(12, time, true);
-    dv.setUint16(14, date, true);
-    dv.setUint32(16, crc, true);
-    dv.setUint32(20, size, true);
-    dv.setUint32(24, size, true);
-    dv.setUint16(28, nameBytes.length, true);
-    dv.setUint16(30, 0, true);
-    dv.setUint16(32, 0, true);
-    dv.setUint16(34, 0, true);
-    dv.setUint16(36, 0, true);
-    dv.setUint32(38, 0, true);
-    dv.setUint32(42, offset, true);
-    new Uint8Array(buf, 46).set(nameBytes);
-    return new Uint8Array(buf);
-  }
-  function makeZipEocd(count, cdSize, cdOffset) {
-    const buf = new ArrayBuffer(22);
-    const dv = new DataView(buf);
-    dv.setUint32(0, 0x06054b50, true);
-    dv.setUint16(4, 0, true);
-    dv.setUint16(6, 0, true);
-    dv.setUint16(8, count, true);
-    dv.setUint16(10, count, true);
-    dv.setUint32(12, cdSize, true);
-    dv.setUint32(16, cdOffset, true);
-    dv.setUint16(20, 0, true);
-    return new Uint8Array(buf);
-  }
-  async function crc32OfBlob(blob) {
-    let crc = 0xFFFFFFFF;
-    const reader = blob.stream().getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      for (let i = 0; i < value.length; i++) crc = (crc >>> 8) ^ crcTable[(crc ^ value[i]) & 0xFF];
-    }
-    return (crc ^ 0xFFFFFFFF) >>> 0;
-  }
-  async function buildZip(entries, onStatus) {
-    const enc = new TextEncoder();
-    const parts = [];
-    const centrals = [];
-    let offset = 0;
-    for (let i = 0; i < entries.length; i++) {
-      const { name, blob } = entries[i];
-      if (onStatus) onStatus(`計算檢查碼 (${i+1}/${entries.length})：${name}`);
-      const crc = await crc32OfBlob(blob);
-      const nameBytes = enc.encode(name);
-      parts.push(makeZipLocalHeader(nameBytes, crc, blob.size), blob);
-      centrals.push(makeZipCentralHeader(nameBytes, crc, blob.size, offset));
-      offset += 30 + nameBytes.length + blob.size;
-    }
-    let cdSize = 0;
-    centrals.forEach(p => cdSize += p.length);
-    return new Blob([...parts, ...centrals, makeZipEocd(entries.length, cdSize, offset)], { type: 'application/zip' });
-  }
-
-  // ===== 新增：儲存或分享 Blob =====
-  async function saveBlob(blob, name, mode = 'download') {
-    const file = new File([blob], name, { type: blob.type || 'application/octet-stream' });
-    if (mode === 'share' && navigator.canShare && navigator.canShare({ files: [file] })) {
-      try { await navigator.share({ files: [file], title: name }); return { shared: true }; }
-      catch (e) { if (e.name === 'AbortError') return { shared: true, aborted: true }; }
-    }
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = name;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
-    return { shared: false };
-  }
-
-  // --- Google 授權 ---
+  // --- Google 授權（Token 管理 / 漸進授權） ---
   const SCOPE_DRIVE = 'https://www.googleapis.com/auth/drive.file';
   const SCOPE_CONTACTS = 'https://www.googleapis.com/auth/contacts.readonly';
   const SCOPE_CALENDAR = 'https://www.googleapis.com/auth/calendar.readonly';
@@ -419,7 +110,7 @@
     tokenClientId = id;
     tokenClient = google.accounts.oauth2.initTokenClient({
       client_id: id,
-      scope: SCOPE_DRIVE,
+      scope: SCOPE_DRIVE, // 連線時只要求 Drive；聯絡人／行事曆在勾選匯出時才額外請求
       callback: response => {
         const p = pendingAuth; pendingAuth = null;
         if (response.error) { if (p) p.reject(new Error(response.error)); return; }
@@ -442,6 +133,7 @@
     $('connection').textContent = '已連線'; $('connection').className = 'pill ok';
   }
 
+  // overrides 可帶 { prompt, scope, include_granted_scopes }；需在使用者點擊（手勢）中呼叫，iOS 才不會擋彈窗
   function requestToken(overrides = {}) {
     return new Promise((resolve, reject) => {
       if (!window.google || !google.accounts || !google.accounts.oauth2) return reject(new Error('Google 登入元件尚未載入'));
@@ -452,6 +144,7 @@
     });
   }
 
+  // 確保手上的 token 有效：先嘗試自動續期；失敗就暫停並請使用者按鈕重新授權，授權後從原處繼續
   function ensureToken(force = false) {
     if (!connectedOnce) return Promise.reject(new Error('尚未連線 Google'));
     if (!force && tokenFresh()) return Promise.resolve();
@@ -487,10 +180,13 @@
       box.hidden = false;
       $('uploadState').textContent = '需要重新授權';
       $('connection').textContent = '授權已過期'; $('connection').className = 'pill warn';
+      notifyReauthNeeded();
       ok.addEventListener('click', onOk); no.addEventListener('click', onNo);
     });
   }
 
+  // --- API 請求 ---
+  // 所有 Drive / People / Calendar 請求都經過這裡：先確保 token 有效，遇到 401 強制續期後重試一次
   async function authFetch(url, options = {}) {
     for (let attempt = 0; attempt < 2; attempt++) {
       await ensureToken(attempt > 0);
@@ -512,7 +208,7 @@
     return response.status === 204 ? null : response.json();
   }
 
-  // --- 資料夾快取 ---
+  // --- 資料夾（本次連線期間快取，省下重複查詢） ---
   const ROOT_NAME = 'iPhone 手動備份';
   const folderCache = new Map();
   let rootFolderPromise = null;
@@ -537,11 +233,12 @@
         return folder.id;
       })();
       folderCache.set(key, p);
-      p.catch(() => folderCache.delete(key));
+      p.catch(() => folderCache.delete(key)); // 失敗的結果不要留在快取裡
     }
     return folderCache.get(key);
   }
 
+  // 備份根資料夾 ID 記在本機；每次連線先驗證它還在（沒被刪除／丟進垃圾桶），避免重複建立同名根資料夾
   function getRootFolderId() {
     if (!rootFolderPromise) {
       rootFolderPromise = (async () => {
@@ -553,7 +250,7 @@
           } catch (e) { console.warn('已儲存的根資料夾無法使用，改為重新尋找:', e.message); }
         }
         const id = await getOrCreateFolder(ROOT_NAME);
-        try { localStorage.setItem(rootKey(), id); } catch (e) { /* 忽略 */ }
+        try { localStorage.setItem(rootKey(), id); } catch (e) { /* 儲存失敗不影響備份 */ }
         return id;
       })();
       rootFolderPromise.catch(() => { rootFolderPromise = null; });
@@ -567,6 +264,7 @@
   function isMedia(file) { return /^(image|video)\//.test(file.type) || MEDIA_EXT.test(file.name); }
   function isPlausibleDate(d) { return d instanceof Date && !isNaN(d) && d.getFullYear() >= 1990 && d.getTime() <= Date.now() + 86400000; }
 
+  // 取得拍攝日期：EXIF → 檔案修改時間 → null（未分類）
   async function getCaptureDate(file) {
     if (file.type.startsWith('image/') || EXIF_EXT.test(file.name)) {
       if (window.exifr) {
@@ -577,9 +275,11 @@
           if (isPlausibleDate(d)) return d;
         } catch (e) { console.warn('無法讀取 EXIF 時間:', e); }
       } else {
-        exifrMissingCount++;
+        exifrMissingCount++; // 備份結束時會在結果訊息中明確提醒
       }
     }
+    // 影片、或沒有 EXIF 的圖片：改用檔案修改時間。
+    // 若修改時間落在「選取當下」5 分鐘內，視為不可靠（可能是 iOS 選取時才產生），改放未分類。
     if (file.lastModified) {
       const d = new Date(file.lastModified);
       if (isPlausibleDate(d) && Date.now() - d.getTime() > 5 * 60 * 1000) return d;
@@ -587,16 +287,20 @@
     return null;
   }
 
+  // 回傳 { id, path }：path 只用來寫進備份紀錄（例如「2024/03月」）
   async function getTargetFolder(file, rootFolderId) {
-    if (!isMedia(file)) return await getOrCreateFolder('其他檔案', rootFolderId);
+    if (!isMedia(file)) return { id: await getOrCreateFolder('其他檔案', rootFolderId), path: '其他檔案' };
     const date = await getCaptureDate(file);
     if (date) {
-      const yearFolderId = await getOrCreateFolder(date.getFullYear().toString(), rootFolderId);
-      return await getOrCreateFolder((date.getMonth() + 1).toString().padStart(2, '0') + '月', yearFolderId);
+      const y = date.getFullYear().toString(), m = (date.getMonth() + 1).toString().padStart(2, '0') + '月';
+      const yearFolderId = await getOrCreateFolder(y, rootFolderId);
+      return { id: await getOrCreateFolder(m, yearFolderId), path: `${y}/${m}` };
     }
-    return await getOrCreateFolder('未分類照片', rootFolderId);
+    return { id: await getOrCreateFolder('未分類照片', rootFolderId), path: '未分類照片' };
   }
 
+  // 重複判斷：「檔名＋大小」都相同才算重複。
+  // 同名但大小不同 → 視為不同檔案，改用「檔名_大小.副檔名」上傳，避免被誤跳過。
   function altName(name, size) {
     const i = name.lastIndexOf('.');
     return i > 0 ? `${name.slice(0, i)}_${size}${name.slice(i)}` : `${name}_${size}`;
@@ -614,18 +318,59 @@
     return { duplicate: false, uploadName: nameTaken ? alt : file.name };
   }
 
-  async function uploadFileWithRetry(file, parentId, onProgress, uploadName, maxRetries = 3) {
+  // 上傳後驗證：大小一定比對；MD5 依設定比對 Drive 回傳的 md5Checksum。
+  // 不符時把剛上傳的壞檔移到垃圾桶（可復原），丟出錯誤讓外層重傳。
+  const md5Wanted = file => verifyMode !== 'size' && (verifyMode === 'md5-all' || file.size <= VERIFY_MAX_BYTES);
+
+  async function trashQuietly(driveId) {
+    if (!driveId) return;
+    try {
+      await apiRequest(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(driveId)}?fields=id`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: true })
+      });
+    } catch (e) { console.warn('無法把驗證失敗的雲端檔案移到垃圾桶:', e.message); }
+  }
+
+  async function verifyUploaded(file, result, vstate, ctx) {
+    if (verifyMode === 'size') { vstate.md5 = 'off'; return; }
+    if (!md5Wanted(file)) { vstate.md5 = 'skipped-large'; return; }
+    let remote = result.md5Checksum;
+    if (!remote && result.id) { // 上傳回應沒帶 MD5：單獨查一次
+      try { const g = await apiRequest(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(result.id)}?fields=md5Checksum`); remote = g && g.md5Checksum; }
+      catch (e) { if (e.cancelled || e.aborted) throw e; console.warn('查詢 md5Checksum 失敗:', e.message); }
+    }
+    if (!remote) { vstate.md5 = 'unavailable'; return; }
+    if (!ctx.localMd5) { // 重試時不必重算
+      const pt = $('progressText');
+      ctx.localMd5 = await IBMd5.ofBlob(file, {
+        shouldStop: () => cancelRequested,
+        onProgress: f => { pt.textContent = `驗證 MD5：${file.name}（${Math.round(f * 100)}%）`; }
+      });
+    }
+    if (ctx.localMd5 === String(remote).toLowerCase()) { vstate.md5 = 'ok'; return; }
+    vstate.md5 = 'mismatch';
+    await trashQuietly(result.id);
+    throw new Error(`MD5 不符（本機 ${ctx.localMd5}，雲端 ${remote}），已把雲端的檔案移到垃圾桶並重傳`);
+  }
+
+  async function uploadFileWithRetry(file, parentId, onProgress, uploadName, vstate = { md5: '' }, maxRetries = 3) {
     let authRetries = 0;
+    const ctx = { localMd5: null };
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        await ensureToken();
+        await ensureToken(); // 每次嘗試前確認 token 仍有效
         throwIfCancelled();
         const result = await uploadFile(file, parentId, onProgress, uploadName);
-        if (result.size && Number(result.size) !== file.size) throw new Error(`檔案大小不符 (本地: ${file.size}, 雲端: ${result.size})`);
+        if (result.size && Number(result.size) !== file.size) {
+          await trashQuietly(result.id);
+          throw new Error(`檔案大小不符 (本地: ${file.size}, 雲端: ${result.size})`);
+        }
+        await verifyUploaded(file, result, vstate, ctx);
         return result;
       } catch (err) {
+        // 使用者取消、放棄重新授權、雲端空間已滿：重試沒有意義，直接往外丟
         if (err.cancelled || err.aborted || err.quota) throw err;
-        if (err.status === 401 && authRetries < 2) {
+        if (err.status === 401 && authRetries < 2) { // 授權過期不算一次失敗：續期後用同一次機會重來
           authRetries++; attempt--;
           if (onProgress) onProgress(0);
           await ensureToken(true);
@@ -648,7 +393,7 @@
       const suffix = `\r\n--${boundary}--`;
       const body = new Blob([prefix, file, suffix]);
       const xhr = new XMLHttpRequest();
-      xhr.open('POST','https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,size,webViewLink,md5Checksum');
+      xhr.open('POST','https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,size,md5Checksum,webViewLink');
       xhr.setRequestHeader('Authorization','Bearer '+accessToken);
       xhr.setRequestHeader('Content-Type','multipart/related; boundary='+boundary);
       xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded/e.total); };
@@ -659,6 +404,7 @@
         } else {
           const e = new Error(`上傳失敗（HTTP ${xhr.status}）：${xhr.responseText.slice(0,400)}`);
           e.status = xhr.status;
+          // 空間已滿：標記成不可重試的錯誤，整批停止
           if (xhr.status === 403 && /storageQuotaExceeded/.test(xhr.responseText)) { e.quota = true; e.message = 'Google 雲端空間已滿（storageQuotaExceeded）'; }
           reject(e);
         }
@@ -670,12 +416,14 @@
     });
   }
 
-  // --- vCard 與 iCal 生成（新增：每行折疊、跳脫、分頁、多行事曆）---
+  // --- vCard 與 iCal 生成 ---
   const pad2 = n => String(n).padStart(2, '0');
   const stampTag = () => { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}`; };
 
+  // RFC 6350 / 5545 TEXT 跳脫：反斜線、換行、逗號、分號
   function esc(v) { return String(v ?? '').replace(/\\/g, '\\\\').replace(/\r?\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;'); }
 
+  // 每行最多 75 octets（UTF-8），續行以空白開頭；不切斷多位元組字元
   function foldLine(line) {
     const enc = new TextEncoder(); const out = []; let cur = '', bytes = 0, limit = 75;
     for (const ch of line) {
@@ -688,6 +436,7 @@
   }
   const toLines = lines => lines.filter(Boolean).map(foldLine).join('\r\n') + '\r\n';
 
+  // 讀取所有分頁
   async function fetchAllPages(baseUrl, listKey) {
     let items = [], pageToken = null;
     do {
@@ -724,6 +473,7 @@
       (p.emailAddresses || []).forEach(em => L.push(`EMAIL;TYPE=${MAIL_TYPE[em.type] || 'INTERNET'}:${flat(em.value)}`));
       (p.addresses || []).forEach(a => L.push(`ADR;TYPE=${ADDR_TYPE[a.type] || 'POSTAL'}:;;${esc(a.streetAddress)};${esc(a.city)};${esc(a.region)};${esc(a.postalCode)};${esc(a.country)}`));
       const b = (p.birthdays || [])[0]?.date;
+      // 沒有年份時沿用 Apple 慣例 1604 作為占位年
       if (b && b.month && b.day) L.push(`BDAY:${b.year ? String(b.year).padStart(4, '0') : '1604'}-${pad2(b.month)}-${pad2(b.day)}`);
       (p.urls || []).forEach(u => L.push(`URL:${flat(u.value)}`));
       const note = (p.biographies || [])[0]?.value; if (note) L.push(`NOTE:${esc(note)}`);
@@ -734,12 +484,9 @@
     return { file, count: people.length };
   }
 
-  // 修正：全天事件用 VALUE=DATE；定時事件用 UTC，避免 +0800Z
   const icsUtc = d => new Date(d).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
-  function icsTimeProp(name, t) {
-    if (t.date) return `${name};VALUE=DATE:${t.date.replace(/-/g, '')}`;
-    return `${name}:${icsUtc(t.dateTime)}`;
-  }
+  const icsDate = s => s.replace(/-/g, '');
+  const icsTime = (name, t) => t.date ? `${name};VALUE=DATE:${icsDate(t.date)}` : `${name}:${icsUtc(t.dateTime)}`;
 
   async function generateCalendarIcs() {
     showResult('正在取得 Google 行事曆...', 'success');
@@ -748,6 +495,7 @@
     const timeMin = rangeVal === 'all' ? new Date('2000-01-01T00:00:00Z') : new Date(now.getFullYear() - Number(rangeVal), now.getMonth(), now.getDate());
     const timeMax = new Date(now.getFullYear() + 2, now.getMonth(), now.getDate());
 
+    // 自己擁有／可編輯的所有行事曆（不含訂閱的節日等唯讀行事曆）
     const cals = await fetchAllPages('https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=250', 'items');
     const own = cals.filter(c => c.accessRole === 'owner' || c.accessRole === 'writer');
     const targets = own.length ? own : [{ id: 'primary', summary: '主要行事曆' }];
@@ -765,8 +513,8 @@
         L.push('BEGIN:VEVENT');
         L.push(`UID:${ev.id}@google-calendar-backup`);
         L.push(`DTSTAMP:${icsUtc(ev.updated || now)}`);
-        L.push(icsTimeProp('DTSTART', ev.start));
-        if (ev.end && (ev.end.date || ev.end.dateTime)) L.push(icsTimeProp('DTEND', ev.end));
+        L.push(icsTime('DTSTART', ev.start));
+        if (ev.end && (ev.end.date || ev.end.dateTime)) L.push(icsTime('DTEND', ev.end));
         L.push(`SUMMARY:${esc(ev.summary || '未命名事件')}`);
         if (ev.location) L.push(`LOCATION:${esc(ev.location)}`);
         if (ev.description) L.push(`DESCRIPTION:${esc(ev.description)}`);
@@ -781,31 +529,132 @@
     return { file, count, calendars: targets.length };
   }
 
-  // --- 雲端檔案瀏覽與下載 ---
-  async function listChildren(parentId) {
-    const files = [];
-    let pageToken = null;
-    do {
-      const q = `'${parentId}' in parents and trashed = false`;
-      let url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=nextPageToken,files(id,name,size,mimeType,createdTime)&pageSize=1000&orderBy=folder,createdTime desc`;
-      if (pageToken) url += `&pageToken=${encodeURIComponent(pageToken)}`;
-      const res = await apiRequest(url);
-      files.push(...(res.files || []));
-      pageToken = res.nextPageToken || null;
-    } while (pageToken);
-    return files;
+  // ===== 雲端還原：清單（分頁）、單檔下載、ZIP 串流、存到相簿 =====
+  // iOS 的限制與對策：
+  //  - 大影片整個放進記憶體（blob）容易讓頁面崩潰 → 有 Service Worker 時改用「串流下載」，資料只經過小段緩衝。
+  //  - 連續觸發數百次下載會被攔截 → 整批改成「單一 ZIP 串流」；沒有 SW 時改成「分批 ZIP」，每份點一下。
+  //  - 要存進「照片」→ 用 navigator.share({files}) 開啟分享表單；它必須由「點擊」直接觸發，所以先準備好、再請使用者點按鈕。
+  const FOLDER_MIME = 'application/vnd.google-apps.folder';
+  const CLOUD_PAGE = 100;
+  const BLOB_LIMIT = 150 * 1024 * 1024;          // 沒有串流可用時，單檔放進記憶體的上限（超過要使用者確認）
+  const SHARE_BATCH_FILES = 20;
+  const SHARE_BATCH_BYTES = 150 * 1024 * 1024;
+  const SHARE_BIG_FILE = 300 * 1024 * 1024;
+  const ZIP_PART_BYTES = 200 * 1024 * 1024;
+  const FLUSH_BYTES = 512 * 1024;                // 串流時，累積到這麼大才傳一次給 SW，減少訊息數
+  let cloudFolderId = null, cloudNextToken = null, cloudSeq = 0, cloudOp = null;
+  const cloudLoaded = new Map();                 // id → 已載入清單中的檔案
+  const cloudSelected = new Set();               // 已勾選的檔案 id
+
+  const isMediaMime = m => /^(image|video)\//.test(m || '');
+  const cancelledError = () => { const e = new Error('已取消'); e.cancelled = true; return e; };
+  // 檔名／路徑片段：拿掉會讓 ZIP 或檔案系統出問題的字元
+  const safeSeg = s => { const t = String(s ?? '').replace(/[\u0000-\u001f\u007f\\/:*?"<>|]/g, '_').trim(); return (!t || t === '.' || t === '..') ? '_' : t; };
+  function uniquePaths(list) {
+    const seen = new Set();
+    for (const f of list) {
+      let p = f.path, n = 2;
+      while (seen.has(p.toLowerCase())) {
+        const slash = p.lastIndexOf('/'), dot = p.lastIndexOf('.');
+        p = (dot > slash + 1) ? `${f.path.slice(0, dot)} (${n})${f.path.slice(dot)}` : `${f.path} (${n})`;
+        n++;
+      }
+      seen.add(p.toLowerCase()); f.path = p;
+    }
+    return list;
+  }
+
+  function setCloudList(...nodes) { $('cloudFileList').replaceChildren(...nodes); }
+  function currentFolderName() { return folderHistory.length ? folderHistory[folderHistory.length - 1].name : 'iPhone 手動備份'; }
+
+  function updateCloudSelUi() {
+    const n = cloudSelected.size;
+    let bytes = 0; cloudSelected.forEach(id => { const f = cloudLoaded.get(id); if (f) bytes += Number(f.size) || 0; });
+    if ($('cloudSelCount')) $('cloudSelCount').textContent = n ? `已選 ${n} 個（${humanSize(bytes)}）` : '未選取（處理整個資料夾）';
+    if ($('cloudSelectAll')) {
+      $('cloudSelectAll').disabled = cloudLoaded.size === 0;
+      $('cloudSelectAll').checked = cloudLoaded.size > 0 && n === cloudLoaded.size;
+    }
+  }
+
+  function setCloudButtons(disabled) {
+    document.querySelectorAll('#tab-cloud .cloud-act, #btnZip, #btnShare').forEach(b => { b.disabled = disabled; });
+  }
+
+  // ----- 清單 -----
+  function renderBreadcrumb() {
+    const crumbEl = $('folderBreadcrumb'); if (!crumbEl) return;
+    const nodes = [];
+    if (folderHistory.length > 1) {
+      const back = el('button', { class: 'secondary btn-small', type: 'button', text: '🔙 返回上一層' });
+      back.addEventListener('click', () => { const prev = folderHistory[folderHistory.length - 2]; loadCloudFiles(prev.id, prev.name); });
+      nodes.push(back, el('br'));
+    }
+    // 資料夾名稱來自雲端，一律以純文字顯示
+    nodes.push(el('span', { class: 'crumb-path', text: '📍 目前位置：' + folderHistory.map(f => f.name).join(' / ') }));
+    crumbEl.replaceChildren(...nodes);
+  }
+
+  function renderCloudRow(file) {
+    const isFolder = file.mimeType === FOLDER_MIME;
+    const sizeStr = file.size ? humanSize(Number(file.size)) : '';
+    const dateStr = new Date(file.createdTime).toLocaleDateString('zh-TW');
+    const li = el('li', { class: 'cloud-row' });
+    if (isFolder) {
+      const info = el('div', { class: 'cloud-info' },
+        el('div', { class: 'cloud-folder', text: '📁 ' + file.name }),
+        el('span', { class: 'cloud-sub', text: dateStr }));
+      info.addEventListener('click', () => loadCloudFiles(file.id, file.name));
+      li.append(info);
+      return li;
+    }
+    cloudLoaded.set(file.id, file);
+    const cb = el('input', { type: 'checkbox', class: 'cloud-pick', 'aria-label': '選取 ' + file.name });
+    cb.dataset.id = file.id;
+    cb.checked = cloudSelected.has(file.id);
+    cb.addEventListener('change', () => { if (cb.checked) cloudSelected.add(file.id); else cloudSelected.delete(file.id); updateCloudSelUi(); });
+    const info = el('div', { class: 'cloud-info' },
+      el('div', { class: 'cloud-file', text: '📄 ' + file.name }),
+      el('span', { class: 'cloud-sub', text: `${dateStr} · ${sizeStr}` }));
+    const btns = el('div', { class: 'row' });
+    const dl = el('button', { class: 'secondary btn-small cloud-act', type: 'button', text: '下載' });
+    dl.addEventListener('click', () => downloadOne(file));
+    btns.append(dl);
+    if (isMediaMime(file.mimeType)) {
+      const sh = el('button', { class: 'secondary btn-small cloud-act', type: 'button', text: '相簿' });
+      sh.addEventListener('click', () => shareToPhotos([file]));
+      btns.append(sh);
+    }
+    li.append(el('div', { class: 'cloud-left' }, cb, info), btns);
+    return li;
+  }
+
+  // 讀一頁（100 筆）。first=true 是進入資料夾的第一頁；之後由「載入更多」用 nextPageToken 接續。
+  async function loadCloudPage(seq, first) {
+    const query = `'${cloudFolderId}' in parents and trashed = false`;
+    const url = 'https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(query) +
+      '&fields=nextPageToken,files(id,name,size,mimeType,createdTime,modifiedTime)' +
+      `&pageSize=${CLOUD_PAGE}&orderBy=folder,createdTime desc` +
+      (cloudNextToken ? '&pageToken=' + encodeURIComponent(cloudNextToken) : '');
+    const res = await apiRequest(url);
+    if (seq !== cloudSeq) return; // 期間已切換資料夾，捨棄這份結果
+    cloudNextToken = res.nextPageToken || null;
+    const files = res.files || [];
+    if (first && !files.length) { setCloudList(el('li', { text: '此資料夾內尚無檔案。' })); $('cloudMore').hidden = true; $('batchActionBar').hidden = true; return; }
+    const rows = files.map(renderCloudRow);
+    if (first) setCloudList(...rows); else $('cloudFileList').append(...rows);
+    $('cloudMore').hidden = !cloudNextToken;
+    $('cloudMore').disabled = false; $('cloudMore').textContent = '載入更多';
+    $('batchActionBar').hidden = false;
+    updateCloudSelUi();
   }
 
   async function loadCloudFiles(targetId = null, targetName = '') {
-    if (!accessToken) { showResult('請先連線 Google 才能讀取雲端清單。', 'error'); return; }
-    const listEl = $('cloudFileList');
-    const crumbEl = $('folderBreadcrumb');
-    const batchBar = $('batchActionBar');
-    const setList = (...nodes) => listEl.replaceChildren(...nodes);
-    setList(el('li', { text: '載入中...' }));
-    currentFolderFiles = [];
-    if (batchBar) batchBar.style.display = 'none';
-
+    if (!accessToken) { setCloudList(el('li', { class: 'error', text: '請先連線 Google 才能讀取雲端清單。' })); return; }
+    const seq = ++cloudSeq;
+    cloudLoaded.clear(); cloudSelected.clear(); cloudNextToken = null; updateCloudSelUi();
+    setCloudList(el('li', { text: '載入中...' }));
+    $('cloudMore').hidden = true; $('batchActionBar').hidden = true;
     try {
       let currentId = targetId;
       if (!currentId) {
@@ -816,128 +665,367 @@
         if (existingIdx !== -1) folderHistory = folderHistory.slice(0, existingIdx + 1);
         else folderHistory.push({ id: currentId, name: targetName });
       }
+      if (seq !== cloudSeq) return;
+      cloudFolderId = currentId;
+      renderBreadcrumb();
+      await loadCloudPage(seq, true);
+    } catch (err) { if (seq === cloudSeq) setCloudList(el('li', { class: 'error', text: '載入失敗：' + err.message })); }
+  }
 
-      if (crumbEl) {
-        const nodes = [];
-        if (folderHistory.length > 1) {
-          const back = el('button', { class: 'secondary btn-small', type: 'button', text: '🔙 返回上一層' });
-          back.addEventListener('click', () => {
-            const prevFolder = folderHistory[folderHistory.length - 2];
-            loadCloudFiles(prevFolder.id, prevFolder.name);
-          });
-          nodes.push(back, el('br'));
+  async function loadMoreCloud() {
+    if (!cloudNextToken) return;
+    const seq = cloudSeq, btn = $('cloudMore');
+    btn.disabled = true; btn.textContent = '載入中…';
+    try { await loadCloudPage(seq, false); }
+    catch (err) {
+      if (seq !== cloudSeq) return;
+      $('cloudFileList').append(el('li', { class: 'error', text: '載入更多失敗：' + err.message }));
+      btn.disabled = false; btn.textContent = '重試載入更多';
+    }
+  }
+
+  // ----- 操作面板（進度、取消、需要使用者點擊的步驟） -----
+  function opStart(msg) {
+    const ctrl = { aborted: false, ac: new AbortController(), rejectTap: null };
+    cloudOp = ctrl;
+    $('cloudOp').hidden = false;
+    $('cloudOpMsg').className = 'hint'; $('cloudOpMsg').textContent = msg;
+    $('cloudOpProgress').hidden = false; $('cloudOpProgress').value = 0;
+    $('cloudOpTap').hidden = true;
+    $('cloudOpCancel').hidden = false; $('cloudOpCancel').disabled = false; $('cloudOpCancel').textContent = '取消';
+    setCloudButtons(true);
+    return ctrl;
+  }
+  function opSet(msg, pct) {
+    if (msg != null) $('cloudOpMsg').textContent = msg;
+    if (pct != null && isFinite(pct)) $('cloudOpProgress').value = Math.max(0, Math.min(100, pct));
+  }
+  function opEnd(msg, kind = '') {
+    cloudOp = null;
+    $('cloudOpMsg').className = 'hint ' + kind; $('cloudOpMsg').textContent = msg;
+    $('cloudOpProgress').hidden = true; $('cloudOpTap').hidden = true;
+    $('cloudOpCancel').hidden = false; $('cloudOpCancel').disabled = false; $('cloudOpCancel').textContent = '關閉';
+    setCloudButtons(false);
+  }
+  function opCancel() {
+    if (!cloudOp) { $('cloudOp').hidden = true; return; }
+    cloudOp.aborted = true; cloudOp.ac.abort();
+    if (cloudOp.rejectTap) cloudOp.rejectTap(cancelledError());
+    $('cloudOpCancel').disabled = true; $('cloudOpMsg').textContent = '正在取消…';
+  }
+  // 等使用者點按鈕；action 會在「點擊事件裡同步開始執行」，navigator.share 才不會被 iOS 擋下。
+  function opTap(ctrl, msg, label, action) {
+    return new Promise((resolve, reject) => {
+      const btn = $('cloudOpTap');
+      opSet(msg, 100);
+      btn.textContent = label; btn.hidden = false; btn.disabled = false;
+      const cleanup = () => { btn.hidden = true; btn.removeEventListener('click', onTap); ctrl.rejectTap = null; };
+      const onTap = () => {
+        btn.disabled = true;
+        let p; try { p = Promise.resolve(action()); } catch (e) { p = Promise.reject(e); }
+        p.then(v => { cleanup(); resolve(v); }, e => { cleanup(); reject(e); });
+      };
+      ctrl.rejectTap = e => { cleanup(); reject(e); };
+      btn.addEventListener('click', onTap);
+    });
+  }
+  // 備份頁以外的分頁遇到授權過期時，提醒使用者去哪裡處理
+  function notifyReauthNeeded() {
+    if (cloudOp) opSet('⚠️ Google 授權已過期。請切到「備份資料」分頁，按「重新授權並繼續」，下載會自動接續。');
+  }
+
+  // ----- 取得 Drive 檔案內容 -----
+  async function openDriveFile(id, ctrl) {
+    let res;
+    try { res = await authFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(id)}?alt=media`, { signal: ctrl ? ctrl.ac.signal : undefined }); }
+    catch (e) { if (ctrl && ctrl.aborted) throw cancelledError(); throw e; }
+    if (!res.ok) { const e = new Error(`下載失敗 (HTTP ${res.status})`); e.status = res.status; throw e; }
+    return res;
+  }
+
+  // 整個讀進記憶體（只用於：沒有串流可用的小檔案、以及要交給分享表單的檔案）
+  async function fetchAsBlob(file, ctrl, onBytes) {
+    const res = await openDriveFile(file.id, ctrl);
+    if (!res.body) return await res.blob();
+    const reader = res.body.getReader(), chunks = []; let got = 0;
+    for (;;) {
+      if (ctrl.aborted) { reader.cancel().catch(() => {}); throw cancelledError(); }
+      let r;
+      try { r = await reader.read(); } catch (e) { if (ctrl.aborted) throw cancelledError(); throw e; }
+      if (r.done) break;
+      chunks.push(r.value); got += r.value.byteLength;
+      if (onBytes) onBytes(got);
+    }
+    return new Blob(chunks, { type: file.mimeType || 'application/octet-stream' });
+  }
+
+  function anchorDownload(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name; a.hidden = true;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 120000); // iOS 需要時間讀取，晚一點才釋放
+  }
+
+  // ----- 串流存檔（頁面 → Service Worker → 瀏覽器下載） -----
+  async function canStreamSave() {
+    if (!('serviceWorker' in navigator) || !navigator.serviceWorker.controller || typeof ReadableStream === 'undefined' || typeof MessageChannel === 'undefined') return false;
+    return new Promise(resolve => {
+      const ch = new MessageChannel();
+      const t = setTimeout(() => resolve(false), 1500); // 舊版 SW 不認得這個指令：逾時就當作不支援
+      ch.port1.onmessage = e => { clearTimeout(t); resolve(!!(e.data && e.data.type === 'ready')); };
+      try { navigator.serviceWorker.controller.postMessage({ action: 'dl-probe' }, [ch.port2]); }
+      catch (e) { clearTimeout(t); resolve(false); }
+    });
+  }
+
+  // source：ReadableStream<Uint8Array>。SW 每次要資料才通知（pull），所以瀏覽器寫入慢，這邊讀取也會跟著慢。
+  function streamSave(filename, source, { size = null, ctrl = null, onProgress = null } = {}) {
+    return new Promise((resolve, reject) => {
+      const id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
+      const ch = new MessageChannel();
+      const reader = (source || new Blob([]).stream()).getReader();
+      let sent = 0, srcDone = false, settled = false, pumping = false;
+
+      const startTimer = setTimeout(() => fail(new Error('串流下載沒有啟動（瀏覽器沒有接手下載）')), 15000);
+      const cleanup = () => { settled = true; clearTimeout(startTimer); try { ch.port1.close(); } catch (e) { /* 忽略 */ } };
+      const fail = err => {
+        if (settled) return;
+        try { ch.port1.postMessage({ type: 'error', message: err.message }); } catch (e) { /* 忽略 */ }
+        cleanup(); reader.cancel(err).catch(() => {}); reject(err);
+      };
+      if (ctrl) ctrl.ac.signal.addEventListener('abort', () => fail(cancelledError()), { once: true });
+
+      async function pump() {
+        if (pumping || settled) return;
+        pumping = true;
+        try {
+          const parts = []; let n = 0;
+          while (n < FLUSH_BYTES) {
+            const r = await reader.read();
+            if (r.done) { srcDone = true; break; }
+            parts.push(r.value); n += r.value.byteLength;
+          }
+          if (settled) return;
+          if (n) {
+            const buf = new Uint8Array(n); let o = 0;
+            for (const p of parts) { buf.set(p, o); o += p.byteLength; }
+            sent += n;
+            ch.port1.postMessage({ type: 'chunk', data: buf.buffer }, [buf.buffer]);
+            if (onProgress) onProgress(sent);
+          }
+          if (srcDone) { ch.port1.postMessage({ type: 'end' }); cleanup(); resolve(sent); }
+        } catch (err) { fail(ctrl && ctrl.aborted ? cancelledError() : err); }
+        finally { pumping = false; }
+      }
+
+      ch.port1.onmessage = e => {
+        const m = e.data || {};
+        if (m.type === 'ready') { // SW 已登記這個下載 → 觸發瀏覽器去取
+          const a = document.createElement('a');
+          a.href = new URL(`./__dl/${id}/${encodeURIComponent(filename)}`, location.href).href;
+          a.hidden = true; // 不加 download 屬性：Chromium 會讓帶 download 的連結繞過 Service Worker；檔名由 Content-Disposition 決定
+          document.body.appendChild(a); a.click(); a.remove();
+        } else if (m.type === 'pull') { clearTimeout(startTimer); pump(); }
+        else if (m.type === 'cancel') fail(cancelledError());  // 使用者在 iOS 下載清單取消
+        else if (m.type === 'expired') fail(new Error('下載連結逾時'));
+      };
+      try {
+        navigator.serviceWorker.controller.postMessage({ action: 'dl-start', id, filename, size }, [ch.port2]);
+      } catch (e) { fail(e); }
+    });
+  }
+
+  // ----- 單檔下載 -----
+  async function downloadOne(file) {
+    if (cloudOp) return;
+    const size = Number(file.size) || 0;
+    const ctrl = opStart(`準備下載：${file.name}`);
+    try {
+      if (await canStreamSave()) {
+        const res = await openDriveFile(file.id, ctrl);
+        await streamSave(file.name, res.body, {
+          size: size || null, ctrl,
+          onProgress: n => opSet(`傳送中：${file.name}\n${humanSize(n)} / ${humanSize(size)}`, size ? n / size * 100 : null)
+        });
+        opEnd(`已交給系統下載：${file.name}。請在 iOS 的下載清單，或「檔案」App 的「下載項目」查看。`, 'success');
+      } else {
+        if (size > BLOB_LIMIT && !confirm(`這個檔案 ${humanSize(size)}，目前無法使用串流下載，必須先整個放進記憶體，iOS 可能會因此重新整理頁面。\n\n建議：重新開啟 App 更新到最新版後再試，或改用「相簿」。\n\n仍要繼續嗎？`)) throw cancelledError();
+        const blob = await fetchAsBlob(file, ctrl, n => opSet(`下載中：${file.name}\n${humanSize(n)} / ${humanSize(size)}`, size ? n / size * 100 : null));
+        anchorDownload(blob, file.name);
+        opEnd(`已觸發下載：${file.name}`, 'success');
+      }
+    } catch (err) { opEnd(err.cancelled ? '已取消。' : `下載失敗：${err.message}`, err.cancelled ? '' : 'error'); }
+  }
+
+  // ----- 批次：決定要處理哪些檔案 -----
+  async function listFolderTree(rootId, rootPath, recursive, ctrl, onCount) {
+    const out = [], stack = [{ id: rootId, path: rootPath }];
+    while (stack.length) {
+      const dir = stack.pop();
+      let token = null;
+      do {
+        if (ctrl.aborted) throw cancelledError();
+        const q = `'${dir.id}' in parents and trashed = false`;
+        let res;
+        try {
+          res = await apiRequest('https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(q) +
+            '&fields=nextPageToken,files(id,name,size,mimeType,modifiedTime)&pageSize=1000' +
+            (token ? '&pageToken=' + encodeURIComponent(token) : ''), { signal: ctrl.ac.signal });
+        } catch (e) { if (ctrl.aborted) throw cancelledError(); throw e; }
+        for (const f of res.files || []) {
+          if (f.mimeType === FOLDER_MIME) { if (recursive) stack.push({ id: f.id, path: dir.path + safeSeg(f.name) + '/' }); }
+          else out.push({ ...f, path: dir.path + safeSeg(f.name) });
         }
-        nodes.push(el('span', { class: 'crumb-path', text: '📍 目前位置：' + folderHistory.map(f => f.name).join(' / ') }));
-        crumbEl.replaceChildren(...nodes);
+        token = res.nextPageToken || null;
+        onCount(out.length);
+      } while (token);
+    }
+    out.sort((a, b) => a.path.localeCompare(b.path, 'zh-Hant'));
+    return uniquePaths(out);
+  }
+
+  async function resolveBatchEntries(ctrl) {
+    if (cloudSelected.size) {
+      const picked = [...cloudSelected].map(id => cloudLoaded.get(id)).filter(Boolean).map(f => ({ ...f, path: safeSeg(f.name) }));
+      return uniquePaths(picked);
+    }
+    opSet('正在列出雲端檔案…');
+    return await listFolderTree(cloudFolderId, '', $('cloudRecursive').checked, ctrl, n => opSet(`正在列出雲端檔案…已找到 ${n} 個`));
+  }
+
+  // ----- ZIP -----
+  // 產生 ZIP 的項目：一次只打開一個 Drive 檔案；打不開的檔案略過，結尾附上「_下載失敗清單.txt」
+  function makeZipEntries(files, ctrl, failures, state, appendFailureList) {
+    return (async function* () {
+      for (const f of files) {
+        if (ctrl.aborted) throw cancelledError();
+        if (/^application\/vnd\.google-apps\./.test(f.mimeType || '')) { failures.push(`${f.path}：Google 原生文件，無法下載`); continue; }
+        state.current = f.path;
+        let res;
+        try { res = await openDriveFile(f.id, ctrl); }
+        catch (e) { if (e.cancelled) throw e; failures.push(`${f.path}：${e.message}`); continue; }
+        state.done++;
+        const entry = { name: f.path, lastModified: f.modifiedTime ? new Date(f.modifiedTime) : Date.now() };
+        if (f.size != null && f.size !== '') entry.size = Number(f.size);
+        if (res.body) entry.stream = res.body; else { entry.data = new Uint8Array(0); }
+        yield entry;
       }
+      if (appendFailureList && failures.length) {
+        yield { name: '_下載失敗清單.txt', lastModified: Date.now(), data: new TextEncoder().encode('以下檔案沒有放進這個 ZIP：\r\n\r\n' + failures.join('\r\n') + '\r\n') };
+      }
+    })();
+  }
 
-      const files = await listChildren(currentId);
-      if (!files.length) { setList(el('li', { text: '此資料夾內尚無檔案。' })); return; }
+  async function zipStreaming(entries, total, zipName, ctrl) {
+    const failures = [], state = { current: '', done: 0 };
+    const zip = IBZip.createZipStream(makeZipEntries(entries, ctrl, failures, state, true));
+    await streamSave(zipName, zip, {
+      size: null, ctrl,
+      onProgress: n => opSet(`打包下載中（${state.done}/${entries.length}）\n${state.current}\n已傳送 ${humanSize(n)} / 約 ${humanSize(total)}`, total ? n / total * 100 : null)
+    });
+    opEnd(`ZIP 已交給系統下載（${state.done} 個檔案）。請在 iOS 的下載清單，或「檔案」App 的「下載項目」查看。` +
+      (failures.length ? `\n有 ${failures.length} 個檔案沒能放進去，詳見 ZIP 內的「_下載失敗清單.txt」。` : ''), failures.length ? 'error' : 'success');
+  }
 
-      const rows = files.map(file => {
-        const isFolder = file.mimeType === 'application/vnd.google-apps.folder';
-        const sizeStr = file.size ? humanSize(Number(file.size)) : '';
-        const dateStr = new Date(file.createdTime).toLocaleDateString('zh-TW');
-        const li = el('li', { class: 'cloud-row' });
-        if (isFolder) {
-          const info = el('div', { class: 'cloud-info' },
-            el('div', { class: 'cloud-folder', text: '📁 ' + file.name }),
-            el('span', { class: 'cloud-sub', text: dateStr }));
-          info.addEventListener('click', () => loadCloudFiles(file.id, file.name));
-          li.append(info);
-        } else {
-          currentFolderFiles.push(file);
-          const info = el('div', { class: 'cloud-info' },
-            el('div', { class: 'cloud-file', text: '📄 ' + file.name }),
-            el('span', { class: 'cloud-sub', text: `${dateStr} · ${sizeStr}` }));
-          const btnWrap = el('div', { style: 'display:flex; gap:6px; flex:none;' });
-          const d = el('button', { class: 'secondary btn-small', type: 'button', text: '下載' });
-          d.addEventListener('click', () => downloadFile(file.id, file.name, false, 'download'));
-          const s = el('button', { class: 'secondary btn-small', type: 'button', text: '分享' });
-          s.addEventListener('click', () => downloadFile(file.id, file.name, false, 'share'));
-          btnWrap.append(d, s);
-          li.append(info, btnWrap);
+  // 沒有串流可用時：把檔案分成幾份（每份約 200MB），一份一份做成 ZIP，每份由使用者點一下下載
+  async function zipInParts(entries, total, zipName, ctrl) {
+    const parts = []; let cur = [], curBytes = 0;
+    for (const f of entries) {
+      const s = Number(f.size) || 0;
+      if (cur.length && curBytes + s > ZIP_PART_BYTES) { parts.push(cur); cur = []; curBytes = 0; }
+      cur.push(f); curBytes += s;
+    }
+    if (cur.length) parts.push(cur);
+    const base = zipName.replace(/\.zip$/i, ''), failures = [];
+    for (let i = 0; i < parts.length; i++) {
+      const state = { current: '', done: 0 };
+      const stream = IBZip.createZipStream(makeZipEntries(parts[i], ctrl, failures, state, i === parts.length - 1));
+      const reader = stream.getReader(), chunks = []; let bytes = 0;
+      for (;;) {
+        if (ctrl.aborted) { reader.cancel().catch(() => {}); throw cancelledError(); }
+        let r;
+        try { r = await reader.read(); } catch (e) { if (ctrl.aborted) throw cancelledError(); throw e; }
+        if (r.done) break;
+        chunks.push(r.value); bytes += r.value.byteLength;
+        opSet(`準備第 ${i + 1}/${parts.length} 份（${state.done}/${parts[i].length}）\n${state.current}`, (i + bytes / Math.max(1, parts[i].reduce((s, f) => s + (Number(f.size) || 0), 0))) / parts.length * 100);
+      }
+      const blob = new Blob(chunks, { type: 'application/zip' });
+      const name = parts.length > 1 ? `${base}_第${i + 1}份共${parts.length}份.zip` : zipName;
+      await opTap(ctrl, `第 ${i + 1}/${parts.length} 份已準備好（${humanSize(blob.size)}）。請點下方按鈕下載。`, `💾 下載第 ${i + 1}/${parts.length} 份`, () => anchorDownload(blob, name));
+    }
+    opEnd(`已觸發 ${parts.length} 份 ZIP 下載。` + (failures.length ? `\n有 ${failures.length} 個檔案沒能放進去，詳見最後一份 ZIP 內的「_下載失敗清單.txt」。` : ''), failures.length ? 'error' : 'success');
+  }
+
+  async function batchZip() {
+    if (cloudOp) return;
+    const ctrl = opStart('正在準備…');
+    try {
+      const entries = await resolveBatchEntries(ctrl);
+      if (!entries.length) throw new Error('沒有可下載的檔案。');
+      const total = entries.reduce((s, f) => s + (Number(f.size) || 0), 0);
+      const streaming = await canStreamSave();
+      if (!confirm(`即將打包 ${entries.length} 個檔案，約 ${humanSize(total)}。\n\n` +
+        (streaming ? '會以單一 ZIP 串流下載，不會佔用大量記憶體。' : '目前無法使用串流下載，會分成約 200 MB 一份，每份需要你點一下按鈕。') + '\n\n要開始嗎？')) throw cancelledError();
+      const zipName = `${safeSeg(currentFolderName())}_${stampTag()}.zip`;
+      if (streaming) await zipStreaming(entries, total, zipName, ctrl);
+      else await zipInParts(entries, total, zipName, ctrl);
+    } catch (err) { opEnd(err.cancelled ? '已取消。' : `打包失敗：${err.message}`, err.cancelled ? '' : 'error'); }
+  }
+
+  // ----- 存到相簿（分享表單） -----
+  async function shareToPhotos(files) {
+    if (cloudOp) return;
+    const ctrl = opStart('正在準備…');
+    try {
+      if (!(navigator.share && navigator.canShare)) throw new Error('這個瀏覽器不支援從網頁分享檔案。請改用「下載」，再從「檔案」App 存到相簿。');
+      const list = files || await resolveBatchEntries(ctrl);
+      const media = list.filter(f => isMediaMime(f.mimeType));
+      const skippedOther = list.length - media.length;
+      if (!media.length) throw new Error('沒有可存到相簿的照片或影片。');
+
+      const batches = []; let cur = [], curBytes = 0;
+      for (const f of media) {
+        const s = Number(f.size) || 0;
+        if (cur.length && (cur.length >= SHARE_BATCH_FILES || curBytes + s > SHARE_BATCH_BYTES)) { batches.push(cur); cur = []; curBytes = 0; }
+        cur.push(f); curBytes += s;
+      }
+      if (cur.length) batches.push(cur);
+
+      const total = media.reduce((s, f) => s + (Number(f.size) || 0), 0);
+      const big = media.filter(f => Number(f.size) > SHARE_BIG_FILE).length;
+      if ((!files || batches.length > 1 || big) && !confirm(`共 ${media.length} 個照片／影片，約 ${humanSize(total)}${skippedOther ? `（另有 ${skippedOther} 個非照片影片檔會略過）` : ''}。\n` +
+        `會分成 ${batches.length} 批，每批都要點一下按鈕開啟分享表單，再選「儲存影像」或「儲存影片」。` +
+        (big ? `\n\n⚠️ 其中 ${big} 個檔案超過 ${humanSize(SHARE_BIG_FILE)}，需要先放進記憶體，iOS 可能會重新整理頁面；大影片建議改用「下載」。` : '') + '\n\n要開始嗎？')) throw cancelledError();
+
+      let opened = 0, dismissed = 0;
+      for (let b = 0; b < batches.length; b++) {
+        const group = batches[b], shareFiles = [];
+        for (let i = 0; i < group.length; i++) {
+          const f = group[i], sz = Number(f.size) || 0;
+          const blob = await fetchAsBlob(f, ctrl, n => opSet(`第 ${b + 1}/${batches.length} 批：下載 ${i + 1}/${group.length}\n${f.name}\n${humanSize(n)} / ${humanSize(sz)}`, sz ? ((b + (i + n / sz) / group.length) / batches.length) * 100 : null));
+          shareFiles.push(new File([blob], f.name, { type: f.mimeType, lastModified: f.modifiedTime ? Date.parse(f.modifiedTime) : Date.now() }));
         }
-        return li;
-      });
-      setList(...rows);
-      if (currentFolderFiles.length > 0 && batchBar) batchBar.style.display = 'flex';
-    } catch (err) { setList(el('li', { class: 'error', text: '載入失敗：' + err.message })); }
-  }
-
-  async function downloadFile(fileId, fileName, isBatch = false, mode = 'download') {
-    try {
-      if (!isBatch) showResult(`正在準備${mode === 'share' ? '分享' : '下載'}：${fileName}...`, 'success');
-      const response = await authFetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`);
-      if (!response.ok) throw new Error(`下載失敗 (HTTP ${response.status})`);
-      const blob = await response.blob();
-      const r = await saveBlob(blob, fileName, mode);
-      if (!isBatch) showResult(mode === 'share' && r.shared ? `已分享：${fileName}` : `已觸發下載：${fileName}`, 'success');
-      return true;
-    } catch (err) {
-      if (!isBatch) showResult(`下載失敗：${err.message}`, 'error');
-      return false;
-    }
-  }
-
-  async function batchDownloadZip() {
-    if (currentFolderFiles.length === 0) return;
-    const btn = $('btnDownloadFolder');
-    btn.disabled = true;
-    try {
-      const entries = [];
-      for (let i = 0; i < currentFolderFiles.length; i++) {
-        const f = currentFolderFiles[i];
-        btn.textContent = `⏳ 下載中 (${i+1}/${currentFolderFiles.length})：${f.name}`;
-        const response = await authFetch(`https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`);
-        if (!response.ok) { console.warn('跳過', f.name, response.status); continue; }
-        const blob = await response.blob();
-        entries.push({ name: f.name, blob });
+        if (!navigator.canShare({ files: shareFiles })) throw new Error('這個瀏覽器無法分享這批檔案。請改用「下載」。');
+        try {
+          await opTap(ctrl, `第 ${b + 1}/${batches.length} 批已準備好（${group.length} 個，${humanSize(shareFiles.reduce((s, f) => s + f.size, 0))}）。請點下方按鈕，在分享表單選「儲存影像／儲存影片」。`,
+            `📲 開啟分享表單（${b + 1}/${batches.length}）`, () => navigator.share({ files: shareFiles }));
+          opened++;
+        } catch (e) {
+          if (e && e.name === 'AbortError') dismissed++;  // 使用者關閉了分享表單：視為略過這一批，繼續下一批
+          else throw e;
+        }
       }
-      if (!entries.length) { showResult('沒有可下載的檔案。', 'error'); return; }
-      btn.textContent = '⏳ 打包 ZIP...';
-      const zip = await buildZip(entries, msg => { btn.textContent = '⏳ ' + msg; });
-      await saveBlob(zip, `iPhoneBackup_${stampTag()}.zip`, 'download');
-      showResult(`已下載 ZIP（${entries.length} 個檔案，共 ${humanSize(zip.size)}）。`, 'success');
-    } catch (e) {
-      showResult('批次下載失敗：' + e.message, 'error');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = '⬇️ 打包成 ZIP 下載（此資料夾）';
-    }
-  }
-
-  async function batchShareFiles() {
-    if (currentFolderFiles.length === 0) return;
-    if (!navigator.canShare) { showResult('此瀏覽器不支援檔案分享，請使用 ZIP 下載。', 'error'); return; }
-    const btn = $('btnShareFolder');
-    btn.disabled = true;
-    try {
-      const files = [];
-      for (let i = 0; i < currentFolderFiles.length; i++) {
-        const f = currentFolderFiles[i];
-        btn.textContent = `⏳ 準備中 (${i+1}/${currentFolderFiles.length})：${f.name}`;
-        const response = await authFetch(`https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`);
-        if (!response.ok) continue;
-        const blob = await response.blob();
-        files.push(new File([blob], f.name, { type: blob.type || 'application/octet-stream' }));
-      }
-      if (!files.length) { showResult('沒有可分享的檔案。', 'error'); return; }
-      if (!navigator.canShare({ files })) { showResult('此瀏覽器不支援多檔分享，請使用 ZIP 下載。', 'error'); return; }
-      await navigator.share({ files, title: '備份檔案' });
-      showResult(`已分享 ${files.length} 個檔案。`, 'success');
-    } catch (e) {
-      if (e.name !== 'AbortError') showResult('分享失敗：' + e.message, 'error');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = '📤 逐檔分享（存到相簿／檔案）';
-    }
+      opEnd(`完成：已開啟 ${opened} 批分享表單` + (dismissed ? `，你關閉了 ${dismissed} 批（那幾批沒有儲存）` : '') + (skippedOther ? `，略過 ${skippedOther} 個非照片影片檔` : '') + '。', dismissed ? '' : 'success');
+    } catch (err) { opEnd(err.cancelled ? '已取消。' : `存到相簿失敗：${err.message}`, err.cancelled ? '' : 'error'); }
   }
 
   // --- 事件綁定 ---
   if ($('mediaPicker')) $('mediaPicker').addEventListener('change', e => addFiles(e.target.files));
   if ($('docPicker')) $('docPicker').addEventListener('change', e => addFiles(e.target.files));
-
+  if ($('vcfPicker')) $('vcfPicker').addEventListener('change', async e => { const fl = Array.from(e.target.files); e.target.value = ''; await addPimFiles(fl, 'vcf'); });
+  if ($('icsPicker')) $('icsPicker').addEventListener('change', async e => { const fl = Array.from(e.target.files); e.target.value = ''; await addPimFiles(fl, 'ics'); });
+  // 勾選匯出的當下才請求唯讀授權（漸進授權）；這次點擊本身就是 iOS 要求的使用者手勢
   async function onExportToggle(e, scope, label) {
     const box = e.target;
     if (box.checked && !hasScope(scope)) {
@@ -958,25 +1046,26 @@
   }
   if ($('includeContacts')) $('includeContacts').addEventListener('change', e => onExportToggle(e, SCOPE_CONTACTS, 'Google 聯絡人'));
   if ($('includeCalendar')) $('includeCalendar').addEventListener('change', e => onExportToggle(e, SCOPE_CALENDAR, 'Google 行事曆'));
-
+  
   if ($('clearSelection')) {
     $('clearSelection').addEventListener('click', () => {
-      selectedFiles = [];
-      if ($('mediaPicker')) $('mediaPicker').value='';
-      if ($('docPicker')) $('docPicker').value='';
+      selectedFiles = []; 
+      if ($('mediaPicker')) $('mediaPicker').value=''; 
+      if ($('docPicker')) $('docPicker').value=''; 
       if ($('includeContacts')) $('includeContacts').checked = false;
       if ($('includeCalendar')) $('includeCalendar').checked = false;
+      pimFiles.length = 0; renderPim(); if ($('pimMsg')) $('pimMsg').textContent = '';
       refreshSelection(); showResult('');
     });
   }
-
+  
   if ($('saveClient')) {
     $('saveClient').addEventListener('click', () => {
       const id = $('clientId').value.trim();
       const msgEl = $('saveResult');
-      if (!id || !id.includes('.apps.googleusercontent.com')) {
+      if (!id || !id.includes('.apps.googleusercontent.com')) { 
         if(msgEl) { msgEl.className = 'error'; msgEl.textContent = '請輸入有效格式的 Google OAuth Web 用戶端 ID。'; }
-        return;
+        return; 
       }
       localStorage.setItem('iphoneDriveBackupClientId', id);
       tokenClient = null; resetDriveCaches();
@@ -1011,16 +1100,24 @@
       accessToken = null; tokenExpiresAt = 0; connectedOnce = false; grantedScopes = new Set(); resetDriveCaches();
       if ($('reauthBox')) $('reauthBox').hidden = true;
       $('connection').textContent = '尚未連線'; $('connection').className = 'pill warn';
-      $('disconnect').disabled = true; $('uploadState').textContent = '待命'; refreshSelection(); renderLedgerStats();
+      cloudSeq++;
+      $('disconnect').disabled = true; $('uploadState').textContent = '待命'; refreshSelection(); renderLedgerStats(); renderHistory(); renderLastBackup();
       showResult('已清除本頁的連線狀態。');
     });
   }
 
   if ($('loadCloudFiles')) $('loadCloudFiles').addEventListener('click', () => loadCloudFiles());
-  if ($('btnDownloadFolder')) $('btnDownloadFolder').addEventListener('click', batchDownloadZip);
-  if ($('btnShareFolder')) $('btnShareFolder').addEventListener('click', batchShareFiles);
+  if ($('cloudMore')) $('cloudMore').addEventListener('click', loadMoreCloud);
+  if ($('btnZip')) $('btnZip').addEventListener('click', () => batchZip());
+  if ($('btnShare')) $('btnShare').addEventListener('click', () => shareToPhotos());
+  if ($('cloudOpCancel')) $('cloudOpCancel').addEventListener('click', opCancel);
+  if ($('cloudSelectAll')) $('cloudSelectAll').addEventListener('change', e => {
+    document.querySelectorAll('#cloudFileList .cloud-pick').forEach(cb => { cb.checked = e.target.checked; if (e.target.checked) cloudSelected.add(cb.dataset.id); else cloudSelected.delete(cb.dataset.id); });
+    updateCloudSelUi();
+  });
 
   // ===== 小工具 =====
+  // 以 DOM 方法建立元素；字串子節點一律當純文字，不會被解析成 HTML（雲端檔名、錯誤訊息都不可信）
   function el(tag, attrs, ...children) {
     const n = document.createElement(tag);
     if (attrs) for (const [k, v] of Object.entries(attrs)) {
@@ -1036,7 +1133,7 @@
     if (cancelRequested) { const e = new Error('已取消'); e.cancelled = true; throw e; }
   }
 
-  // ===== 螢幕喚醒 =====
+  // ===== 螢幕喚醒保持 =====
   function setWakeNote(msg, warn = false) {
     const n = $('wakeNote'); if (!n) return;
     n.textContent = msg; n.className = 'hint' + (warn ? ' warn-text' : '');
@@ -1046,7 +1143,7 @@
     if (!('wakeLock' in navigator)) { setWakeNote('⚠️ 這個瀏覽器不支援螢幕常亮，備份期間請手動保持螢幕亮起。', true); return; }
     try {
       const lock = await navigator.wakeLock.request('screen');
-      if (!uploading) { try { await lock.release(); } catch (e) { /* 忽略 */ } return; }
+      if (!uploading) { try { await lock.release(); } catch (e) { /* 忽略 */ } return; } // 等待期間備份已結束
       wakeLock = lock;
       setWakeNote('🔆 備份期間會保持螢幕亮起。');
     } catch (e) {
@@ -1059,12 +1156,16 @@
     if (lock && !lock.released) { try { await lock.release(); } catch (e) { /* 忽略 */ } }
     setWakeNote('');
   }
+  // 頁面被切到背景時系統會自動釋放喚醒鎖；回到前景要重新要求
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') { if (uploading) hiddenDuringUpload = true; return; }
     if (uploading) acquireWakeLock();
     if (swReg) swReg.update().catch(() => {});
   });
 
+  // ===== 上傳前檢查雲端剩餘空間 =====
+  // 回傳 { proceed }。取不到容量資訊時不擋（只記 console）；空間不足時交給使用者決定，
+  // 因為「已存在的重複檔」會被跳過，實際需要的空間可能比總大小少。
   async function confirmEnoughSpace(jobs) {
     const need = jobs.reduce((sum, f) => sum + f.size, 0);
     let quota;
@@ -1075,7 +1176,7 @@
       console.warn('無法取得雲端容量，略過空間檢查:', e.message);
       return { proceed: true };
     }
-    if (!quota || !quota.limit) return { proceed: true };
+    if (!quota || !quota.limit) return { proceed: true }; // 沒有容量上限
     const free = Math.max(0, Number(quota.limit) - Number(quota.usage || 0));
     if (need <= free) return { proceed: true };
     const ok = confirm(
@@ -1086,14 +1187,19 @@
     return { proceed: ok };
   }
 
-  // ===== 本機備份帳本 =====
+  // ===== 本機備份帳本（IndexedDB） =====
+  // 記住「哪個本機檔案已備份成 Drive 上的哪個檔案」，之後重複選取同一批照片時，
+  // 不必逐檔做 EXIF 分類、查資料夾、查重複、上傳。
+  // 帳本只是加速用的快取，Drive 才是事實：命中帳本的檔案，跳過前一定會向 Drive 驗證
+  // 「檔案還在、沒進垃圾桶、大小相符」，驗證不過就照常重新備份。所以帳本遺失或過時只會變慢，不會漏備份。
+  // 帳本以 Google 帳號（permissionId）分開，換帳號不會互相影響。
   const LEDGER_DB = 'iphoneBackupLedger';
   const LEDGER_STORE = 'files';
-  const LEDGER_VERIFY_GET_LIMIT = 25;
+  const LEDGER_VERIFY_GET_LIMIT = 25; // 命中數 ≤ 此值：逐檔 files.get；超過：一次列出整個備份清單比對
   const fingerprint = f => `${f.name}|${f.size}|${f.lastModified}`;
   const ledgerId = (acct, f) => `${acct}|${fingerprint(f)}`;
   const inLedger = f => !!ledgerAcct && ledgerKeys.has(ledgerId(ledgerAcct, f));
-  const generatedFiles = new WeakSet();
+  const generatedFiles = new WeakSet(); // 程式產生的 .vcf/.ics（檔名帶時間戳，每次都是新檔），不進帳本
 
   const idbReq = r => new Promise((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
   const txDone = tx => new Promise((resolve, reject) => {
@@ -1106,10 +1212,15 @@
     if (!ledgerDbPromise) {
       ledgerDbPromise = new Promise((resolve, reject) => {
         if (!window.indexedDB) return reject(new Error('此瀏覽器不支援 IndexedDB'));
-        const req = indexedDB.open(LEDGER_DB, 1);
+        const req = indexedDB.open(LEDGER_DB, 2); // v2：新增備份紀錄（runs、runItems）；帳本資料原封不動
         req.onupgradeneeded = () => {
-          const st = req.result.createObjectStore(LEDGER_STORE, { keyPath: 'id' });
-          st.createIndex('acct', 'acct');
+          const db = req.result;
+          if (!db.objectStoreNames.contains(LEDGER_STORE)) {
+            const st = db.createObjectStore(LEDGER_STORE, { keyPath: 'id' });
+            st.createIndex('acct', 'acct');
+          }
+          if (!db.objectStoreNames.contains('runs')) db.createObjectStore('runs', { keyPath: 'id' });
+          if (!db.objectStoreNames.contains('runItems')) db.createObjectStore('runItems', { keyPath: 'runId' });
         };
         req.onsuccess = () => { const db = req.result; db.onversionchange = () => db.close(); resolve(db); };
         req.onerror = () => reject(req.error || new Error('無法開啟帳本資料庫'));
@@ -1120,10 +1231,10 @@
     return ledgerDbPromise;
   }
 
-  async function ledgerStore(mode = 'readonly') {
+  async function ledgerStore(mode = 'readonly', name = LEDGER_STORE) {
     const db = await openLedgerDb();
-    const tx = db.transaction(LEDGER_STORE, mode);
-    return { tx, store: tx.objectStore(LEDGER_STORE) };
+    const tx = db.transaction(name, mode);
+    return { tx, store: tx.objectStore(name) };
   }
   async function ledgerRecords(acct) {
     const { store } = await ledgerStore();
@@ -1142,6 +1253,7 @@
     ids.forEach(id => ledgerKeys.delete(id));
   }
 
+  // 以 Drive 的 permissionId 當帳號識別碼（不含 email）。取不到就回傳 null：本次不使用帳本，備份照常進行。
   async function getLedgerAccount() {
     if (ledgerAcct) return ledgerAcct;
     if (!ledgerAcctPromise) {
@@ -1151,11 +1263,11 @@
           const r = await apiRequest('https://www.googleapis.com/drive/v3/about?fields=user(permissionId)');
           const id = r && r.user && r.user.permissionId;
           if (!id) throw new Error('Drive 沒有回傳帳號識別碼');
-          if (epoch === ledgerEpoch) ledgerAcct = id;
+          if (epoch === ledgerEpoch) ledgerAcct = id; // 期間若已斷線／換帳號，不採用這個結果
           return id;
         } catch (e) {
           console.warn('無法取得 Google 帳號識別碼，本次不使用帳本:', e.message);
-          if (epoch === ledgerEpoch) ledgerAcctPromise = null;
+          if (epoch === ledgerEpoch) ledgerAcctPromise = null; // 失敗不快取，下次再試
           return null;
         }
       })();
@@ -1175,7 +1287,8 @@
     } catch (e) { console.warn('讀取帳本失敗:', e); }
   }
 
-  async function ledgerRecord(file, driveId, folderId, uploadName) {
+  // 成功上傳、或發現 Drive 已有「同名同大小」檔案時記一筆。寫入失敗不影響備份。
+  async function ledgerRecord(file, driveId, folderId, uploadName, md5) {
     if (!driveId || generatedFiles.has(file)) return;
     try {
       const acct = await getLedgerAccount();
@@ -1183,7 +1296,8 @@
       const now = Date.now();
       const rec = {
         id: ledgerId(acct, file), acct, name: file.name, size: file.size, lastModified: file.lastModified,
-        driveId, folderId: folderId || null, uploadName: uploadName || file.name, uploadedAt: now, verifiedAt: now
+        driveId, folderId: folderId || null, uploadName: uploadName || file.name, uploadedAt: now, verifiedAt: now,
+        md5: md5 || null
       };
       const { tx, store } = await ledgerStore('readwrite');
       store.put(rec);
@@ -1192,6 +1306,10 @@
     } catch (e) { console.warn('寫入帳本失敗（不影響備份）:', e); }
   }
 
+  // 向 Drive 確認這些帳本紀錄對應的檔案是否還在。
+  // 回傳 { confirmed, stale }（都是 Drive 檔案 ID 的 Set）：
+  //   confirmed = 仍存在、不在垃圾桶、大小相符；stale = 確定已不存在／在垃圾桶／大小不符。
+  //   兩者都不含的（例如網路錯誤）代表「無法確認」：不跳過、也不刪帳本，交給一般流程處理。
   async function verifyDriveFiles(records, opts = {}) {
     const check = opts.cancellable === false ? () => {} : throwIfCancelled;
     const confirmed = new Set(), stale = new Set();
@@ -1212,6 +1330,7 @@
       return { confirmed, stale };
     }
 
+    // 筆數多：一次列出本 App 建立的所有未刪除檔案（每頁 1000 筆），比逐檔查詢省很多請求
     const sizes = new Map(records.map(r => [r.driveId, r.size]));
     const q = "trashed = false and mimeType != 'application/vnd.google-apps.folder'";
     let pageToken = null;
@@ -1221,12 +1340,14 @@
       for (const f of res.files || []) if (sizes.has(f.id) && Number(f.size) === sizes.get(f.id)) confirmed.add(f.id);
       pageToken = res.nextPageToken || null;
     } while (pageToken);
+    // 整份清單都讀完了才會走到這裡：沒出現在清單裡的，就是確定不在了
     sizes.forEach((_, id) => { if (!confirmed.has(id)) stale.add(id); });
     return { confirmed, stale };
   }
 
+  // 備份前先比對帳本：已備份且 Drive 驗證仍在的檔案直接跳過（不分類、不查重複、不上傳）。
   async function planWithLedger(jobs) {
-    const plan = { toProcess: jobs, ledgerSkipped: [], stale: 0 };
+    const plan = { toProcess: jobs, ledgerSkipped: [], stale: 0, skipRecs: new Map() };
     const acct = await getLedgerAccount();
     if (!acct) return plan;
 
@@ -1249,7 +1370,7 @@
 
     const skip = new Set(), staleIds = [];
     hits.forEach(({ file, rec }) => {
-      if (v.confirmed.has(rec.driveId)) skip.add(file);
+      if (v.confirmed.has(rec.driveId)) { skip.add(file); plan.skipRecs.set(file, rec); }
       else if (v.stale.has(rec.driveId)) staleIds.push(rec.id);
     });
     try { await ledgerDeleteMany(staleIds); } catch (e) { console.warn('清理過時帳本項目失敗:', e); }
@@ -1259,6 +1380,7 @@
     return plan;
   }
 
+  // ----- 設定頁：帳本資訊、同步驗證、清除；備份頁：移除已備份的檔案 -----
   function setLedgerMsg(msg, ok) {
     const m = $('ledgerMsg'); if (!m) return;
     m.className = 'hint ' + (ok === true ? 'success' : ok === false ? 'error' : '');
@@ -1270,7 +1392,7 @@
     if ($('ledgerSync')) $('ledgerSync').disabled = true;
     try {
       let persisted = null;
-      try { if (navigator.storage && navigator.storage.persisted) persisted = await navigator.storage.persisted(); } catch (e) { /* 忽略 */ }
+      try { if (navigator.storage && navigator.storage.persisted) persisted = await navigator.storage.persisted(); } catch (e) { /* 不支援就略過 */ }
       const persistText = persisted === true ? '已啟用' : persisted === false ? '未啟用（儲存空間吃緊時，系統可能清除帳本；清除只會讓備份變慢）' : '未知';
       if (!accessToken) {
         const { store } = await ledgerStore();
@@ -1289,10 +1411,11 @@
   }
 
   async function initLedger() {
-    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* 忽略 */ }
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) { /* 盡力而為 */ }
     await refreshLedgerKeys();
     refreshSelection();
     renderLedgerStats();
+    renderHistory(); renderLastBackup(); // 已取得帳號：改成只顯示這個帳號的紀錄
   }
 
   async function pruneBackedUp() {
@@ -1351,21 +1474,406 @@
   if ($('ledgerClear')) $('ledgerClear').addEventListener('click', clearLedger);
   if ($('pruneBackedUp')) $('pruneBackedUp').addEventListener('click', pruneBackedUp);
 
-  // 備份紀錄 UI
-  if ($('toggleHistory')) $('toggleHistory').addEventListener('click', () => {
-    historyDetailOpen = !historyDetailOpen;
-    $('toggleHistory').textContent = historyDetailOpen ? '收合詳細' : '顯示詳細';
-    renderHistoryDetails();
-  });
-  if ($('exportHistory')) $('exportHistory').addEventListener('click', exportHistoryJson);
-  if ($('clearHistory')) $('clearHistory').addEventListener('click', async () => {
-    if (!confirm('要清除本機備份紀錄嗎？（不影響 Drive 上的檔案與帳本）')) return;
-    await clearBackupRuns();
-    showResult('已清除備份紀錄。', 'success');
-    loadBackupHistory();
-  });
+  // ===== 備份紀錄（IndexedDB）、「上次備份」提醒、匯出 =====
+  // 'runs' 存每次備份的摘要；'runItems' 存逐檔結果（另外放，列表只讀摘要，不必把幾千筆檔案一起載入）。
+  const RUNS_STORE = 'runs';
+  const ITEMS_STORE = 'runItems';
+  const RUNS_KEEP = 50;             // 最多保留最近幾次
+  const RUN_ITEMS_CAP = 20000;      // 單次備份最多記錄幾個檔案（超過仍會計入統計）
+  const REMIND_KEY = 'iphoneBackupRemindDays';
+  const RUN_STATUS = { running: '進行中', complete: '完成', partial: '部分完成', cancelled: '已取消', stopped: '已中止', interrupted: '中斷', failed: '失敗' };
+  const RESULT_LABEL = { uploaded: '已上傳', 'dup-skip': '跳過（雲端已有）', 'ledger-skip': '跳過（帳本）', failed: '失敗', unprocessed: '未處理' };
+  const MD5_LABEL = { ok: 'MD5 相符', mismatch: 'MD5 不符', 'skipped-large': '未驗證 MD5（檔案超過上限）', unavailable: '雲端沒有提供 MD5', off: '' };
+  let currentRun = null;
 
-  // ===== 備份流程 =====
+  const pad = n => String(n).padStart(2, '0');
+  const fmtTime = ms => { if (!ms) return '—'; const d = new Date(ms); return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  function ago(ms) {
+    const s = Math.max(0, (Date.now() - ms) / 1000);
+    if (s < 90) return '剛剛';
+    if (s < 3600) return Math.round(s / 60) + ' 分鐘前';
+    if (s < 86400) return Math.round(s / 3600) + ' 小時前';
+    return Math.floor(s / 86400) + ' 天前';
+  }
+  const fmtDuration = ms => { const s = Math.round(ms / 1000); return s < 60 ? `${s} 秒` : s < 3600 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${Math.floor(s / 3600)} 小時 ${Math.floor(s % 3600 / 60)} 分`; };
+
+  async function runsAll() {
+    const { store } = await ledgerStore('readonly', RUNS_STORE);
+    const all = await idbReq(store.getAll());
+    return all.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+  }
+  async function runItemsOf(runId) {
+    const { store } = await ledgerStore('readonly', ITEMS_STORE);
+    const rec = await idbReq(store.get(runId));
+    return (rec && rec.items) || [];
+  }
+  function runSummary(run) { const { items, _saved, ...summary } = run; return summary; }
+  async function runPersist(run, withItems = true) {
+    const db = await openLedgerDb();
+    const tx = db.transaction(withItems ? [RUNS_STORE, ITEMS_STORE] : [RUNS_STORE], 'readwrite');
+    tx.objectStore(RUNS_STORE).put(runSummary(run));
+    if (withItems) tx.objectStore(ITEMS_STORE).put({ runId: run.id, items: run.items });
+    await txDone(tx);
+    run._saved = run.items ? run.items.length : 0;
+  }
+  async function runsDelete(ids) {
+    if (!ids.length) return;
+    const db = await openLedgerDb();
+    const tx = db.transaction([RUNS_STORE, ITEMS_STORE], 'readwrite');
+    ids.forEach(id => { tx.objectStore(RUNS_STORE).delete(id); tx.objectStore(ITEMS_STORE).delete(id); });
+    await txDone(tx);
+  }
+  async function runsPrune() {
+    const all = await runsAll();
+    await runsDelete(all.slice(RUNS_KEEP).map(r => r.id));
+  }
+
+  // 所有紀錄寫入都是「盡力而為」：失敗只記 console，不影響備份本身
+  async function beginRun(kind, notes) {
+    try { await getLedgerAccount(); } catch (e) { /* 取不到帳號就不分帳號 */ }
+    const startedAt = Date.now();
+    const run = {
+      id: 'r' + startedAt + Math.random().toString(36).slice(2, 6),
+      acct: ledgerAcct || null, startedAt, updatedAt: startedAt, endedAt: null,
+      status: 'running', kind, verifyMode, notes: notes.slice(), itemsTruncated: false,
+      counts: { total: 0, uploaded: 0, dupSkipped: 0, ledgerSkipped: 0, failed: 0, unprocessed: 0, bytesUploaded: 0, md5Ok: 0, md5Mismatch: 0, md5Skipped: 0 },
+      items: [], _saved: 0
+    };
+    currentRun = run;
+    try { await runPersist(run); } catch (e) { console.warn('建立備份紀錄失敗（不影響備份）:', e); }
+    return run;
+  }
+
+  function recordItem(run, file, f) {
+    const c = run.counts;
+    c.total++;
+    if (f.result === 'uploaded') { c.uploaded++; c.bytesUploaded += file.size; }
+    else if (f.result === 'dup-skip') c.dupSkipped++;
+    else if (f.result === 'ledger-skip') c.ledgerSkipped++;
+    else if (f.result === 'failed') c.failed++;
+    else if (f.result === 'unprocessed') c.unprocessed++;
+    if (f.md5 === 'ok') c.md5Ok++; else if (f.md5 === 'mismatch') c.md5Mismatch++; else if (f.md5 === 'skipped-large') c.md5Skipped++;
+    const item = {
+      name: file.name, size: file.size, result: f.result, folder: f.folder || '', driveId: f.driveId || '',
+      uploadName: f.uploadName || '', md5: f.md5 || '', error: f.error || '', ms: f.ms || 0, at: Date.now()
+    };
+    if (run.items.length < RUN_ITEMS_CAP) run.items.push(item); else run.itemsTruncated = true;
+    run.updatedAt = item.at;
+  }
+
+  // 備份途中定期存檔：App 被 iOS 關掉時，已完成的部分仍留在紀錄裡
+  let checkpointBusy = false;
+  async function runCheckpoint(run) {
+    const n = run.items.length;
+    if (checkpointBusy || n - (run._saved || 0) < Math.max(10, n * 0.1)) return;
+    checkpointBusy = true;
+    try { await runPersist(run); } catch (e) { console.warn('備份紀錄存檔失敗:', e); }
+    finally { checkpointBusy = false; }
+  }
+
+  async function finishRun(run, status, errorMsg) {
+    run.status = status; run.endedAt = Date.now(); run.updatedAt = run.endedAt;
+    if (errorMsg) run.error = String(errorMsg).slice(0, 500);
+    try { await runPersist(run); await runsPrune(); } catch (e) { console.warn('寫入備份紀錄失敗:', e); }
+    if (currentRun === run) currentRun = null;
+  }
+
+  // App 在備份途中被關閉：下次開啟時把「進行中」標成「中斷」
+  async function markInterruptedRuns() {
+    try {
+      const stuck = (await runsAll()).filter(r => r.status === 'running' && !(currentRun && currentRun.id === r.id));
+      for (const r of stuck) { r.status = 'interrupted'; r.endedAt = r.updatedAt || r.startedAt; await runPersist(r, false); }
+    } catch (e) { console.warn('整理中斷的備份紀錄失敗:', e); }
+  }
+
+  // 舊版（v3.8 以前）只留最近 5 筆摘要在 localStorage：搬進新紀錄，只做一次
+  async function migrateLegacyHistory() {
+    let legacy = [];
+    try { legacy = JSON.parse(localStorage.getItem('iphoneBackupHistory') || '[]'); } catch (e) { return; }
+    if (!Array.isArray(legacy) || !legacy.length) return;
+    try {
+      const now = new Date();
+      for (let i = 0; i < legacy.length; i++) {
+        const h = legacy[i], m = /^(\d+)\/(\d+) (\d+):(\d+)$/.exec(String(h.time));
+        let ts = now.getTime() - (i + 1) * 3600000; // 解析不到時間：排在後面即可
+        if (m) {
+          let d = new Date(now.getFullYear(), Number(m[1]) - 1, Number(m[2]), Number(m[3]), Number(m[4]));
+          if (d.getTime() > now.getTime() + 86400000) d = new Date(now.getFullYear() - 1, Number(m[1]) - 1, Number(m[2]), Number(m[3]), Number(m[4]));
+          ts = d.getTime();
+        }
+        const failed = Number(h.failures) || 0;
+        await runPersist({
+          id: 'legacy-' + ts + '-' + i, acct: null, startedAt: ts, updatedAt: ts, endedAt: ts,
+          status: failed ? 'partial' : 'complete', kind: 'legacy', legacy: true, verifyMode: 'size', notes: ['舊版紀錄：只有數量統計，沒有逐檔資料'],
+          counts: { total: 0, uploaded: Number(h.success) || 0, dupSkipped: Number(h.skipped) || 0, ledgerSkipped: 0, failed, unprocessed: 0, bytesUploaded: 0, md5Ok: 0, md5Mismatch: 0, md5Skipped: 0 },
+          items: []
+        }, false);
+      }
+      localStorage.removeItem('iphoneBackupHistory');
+    } catch (e) { console.warn('搬移舊版紀錄失敗:', e); }
+  }
+
+  // 已連線：只顯示目前帳號（與沒有帳號資訊的舊紀錄）；未連線：全部顯示
+  async function visibleRuns() {
+    const all = await runsAll();
+    return (accessToken && ledgerAcct) ? all.filter(r => !r.acct || r.acct === ledgerAcct) : all;
+  }
+
+  // ----- 上次備份 -----
+  const getRemindDays = () => { const v = Number(localStorage.getItem(REMIND_KEY)); return Number.isFinite(v) && localStorage.getItem(REMIND_KEY) !== null ? v : 7; };
+
+  async function renderLastBackup() {
+    const card = $('lastBackupCard'); if (!card) return;
+    let runs;
+    try { runs = await visibleRuns(); }
+    catch (e) { $('lastBackupPill').textContent = '無法讀取'; $('lastBackupPill').className = 'pill warn'; $('lastBackupDetail').textContent = '無法讀取備份紀錄：' + e.message; return; }
+    const finished = r => r.status !== 'running' && (r.counts.uploaded + r.counts.dupSkipped + r.counts.ledgerSkipped) > 0;
+    const last = runs.find(finished);
+    const latest = runs.find(r => r.status !== 'running');
+    const remind = getRemindDays();
+    const title = $('lastBackupTitle'), pill = $('lastBackupPill'), detail = $('lastBackupDetail');
+    let level = '';
+
+    if (!last) {
+      title.textContent = '⏱ 上次備份：尚無紀錄';
+      detail.textContent = '還沒有成功備份的紀錄。選好檔案後按「備份所選資料到 Google Drive」。';
+      pill.textContent = remind ? '建議立刻備份' : '尚未備份'; level = remind ? 'bad' : '';
+    } else {
+      const t = last.endedAt || last.updatedAt || last.startedAt;
+      const days = Math.floor((Date.now() - t) / 86400000);
+      title.textContent = `⏱ 上次備份：${fmtTime(t)}（${ago(t)}）`;
+      const c = last.counts;
+      detail.textContent = `成功上傳 ${c.uploaded}、跳過 ${c.dupSkipped + c.ledgerSkipped}、失敗 ${c.failed}` + (last.legacy ? '（舊版紀錄，時間為估算）' : '');
+      if (remind && days >= remind) { pill.textContent = `已 ${days} 天沒備份`; level = 'bad'; detail.textContent += `\n已超過你設定的 ${remind} 天，建議現在備份。`; }
+      else { pill.textContent = '正常'; level = ''; }
+    }
+    if (latest) {
+      const c = latest.counts;
+      if (c.failed + c.unprocessed > 0) {
+        detail.textContent += `\n最近一次（${fmtTime(latest.endedAt || latest.startedAt)}，${RUN_STATUS[latest.status] || latest.status}）有 ${c.failed} 個失敗、${c.unprocessed} 個未處理，可按「只重試」。`;
+        if (level !== 'bad') { level = 'warn'; if (pill.textContent === '正常') pill.textContent = '有未完成的檔案'; }
+      }
+    }
+    card.className = 'card lastbk' + (level ? ' ' + level : '');
+    pill.className = 'pill' + (level === 'bad' ? ' bad' : level === 'warn' ? ' warn' : ' ok');
+    detail.style.whiteSpace = 'pre-line';
+  }
+
+  // ----- 備份紀錄列表 -----
+  const FILE_PAGE = 200;
+
+  function runFileRow(it) {
+    const label = RESULT_LABEL[it.result] || it.result;
+    const row = el('div', { class: 'hist-file' },
+      el('span', { class: 'r-' + it.result, text: label }), ` · ${it.name}（${humanSize(it.size)}）`);
+    const extra = [];
+    if (it.folder) extra.push('📁 ' + it.folder);
+    if (it.uploadName && it.uploadName !== it.name) extra.push('雲端檔名：' + it.uploadName);
+    if (MD5_LABEL[it.md5]) extra.push(MD5_LABEL[it.md5]);
+    if (it.error) extra.push('⚠️ ' + it.error);
+    if (extra.length) row.append(el('br'), el('span', { class: 'filemeta', text: extra.join('｜') }));
+    return row;
+  }
+
+  function renderRunDetail(box, run) {
+    box.replaceChildren();
+    const c = run.counts;
+    const lines = [];
+    lines.push(`開始：${fmtTime(run.startedAt)}` + (run.endedAt ? `｜花費 ${fmtDuration(run.endedAt - run.startedAt)}` : ''));
+    if (!run.legacy) lines.push(`處理 ${c.total} 個檔案｜上傳量 ${humanSize(c.bytesUploaded)}｜驗證：${run.verifyMode === 'size' ? '只比對大小' : run.verifyMode === 'md5-all' ? '大小＋MD5（全部）' : '大小＋MD5（100 MB 以下）'}`);
+    if (c.md5Ok || c.md5Mismatch || c.md5Skipped) lines.push(`MD5：相符 ${c.md5Ok}｜不符 ${c.md5Mismatch}｜未驗證 ${c.md5Skipped}`);
+    if (run.kind === 'retry') lines.push('這次是「只重試失敗／未完成的檔案」');
+    (run.notes || []).forEach(n => lines.push(n));
+    if (run.error) lines.push('錯誤：' + run.error);
+    if (run.itemsTruncated) lines.push(`逐檔紀錄只保留前 ${RUN_ITEMS_CAP} 筆（統計數字仍是完整的）。`);
+    box.append(el('div', { class: 'hint', text: lines.join('\n'), style: 'white-space:pre-line; margin-top:6px;' }));
+
+    const acts = el('div', { class: 'row', style: 'margin:8px 0;' });
+    const bCsv = el('button', { class: 'secondary btn-small', type: 'button', text: '匯出此次 CSV' });
+    const bJson = el('button', { class: 'secondary btn-small', type: 'button', text: '匯出此次 JSON' });
+    const bDel = el('button', { class: 'secondary btn-small', type: 'button', text: '刪除此筆' });
+    bCsv.addEventListener('click', () => exportRuns([run.id], 'csv'));
+    bJson.addEventListener('click', () => exportRuns([run.id], 'json'));
+    bDel.addEventListener('click', async () => {
+      if (!confirm('刪除這一次的備份紀錄？（不會刪除 Drive 上的檔案）')) return;
+      try { await runsDelete([run.id]); } catch (e) { setHistMsg('刪除失敗：' + e.message, false); return; }
+      await renderHistory(); renderLastBackup();
+    });
+    acts.append(bCsv, bJson, bDel);
+    box.append(acts);
+    if (run.legacy) return;
+
+    const filter = el('select', { 'aria-label': '篩選檔案結果' });
+    [['all', '全部'], ['failed', '失敗'], ['uploaded', '已上傳'], ['skip', '跳過'], ['unprocessed', '未處理']].forEach(([v, t]) => filter.append(el('option', { value: v, text: t })));
+    const list = el('div', { class: 'hist-files' });
+    const more = el('button', { class: 'secondary btn-small', type: 'button', text: '顯示更多', style: 'margin-top:6px;' });
+    box.append(filter, list, more);
+    let items = null, shown = 0, filtered = [];
+    const paint = reset => {
+      if (reset) { list.replaceChildren(); shown = 0; }
+      filtered.slice(shown, shown + FILE_PAGE).forEach(it => list.append(runFileRow(it)));
+      shown = Math.min(filtered.length, shown + FILE_PAGE);
+      more.hidden = shown >= filtered.length;
+      if (!filtered.length) list.replaceChildren(el('div', { class: 'hist-file', text: items && items.length === 0 ? '沒有逐檔紀錄（可能是備份途中 App 被關閉）。' : '沒有符合的檔案。' }));
+    };
+    const applyFilter = () => {
+      const v = filter.value;
+      filtered = items.filter(it => v === 'all' || (v === 'skip' ? (it.result === 'dup-skip' || it.result === 'ledger-skip') : it.result === v));
+      paint(true);
+    };
+    filter.addEventListener('change', applyFilter);
+    more.addEventListener('click', () => paint(false));
+    runItemsOf(run.id).then(r => { items = r; applyFilter(); }).catch(e => { list.replaceChildren(el('div', { class: 'hist-file error', text: '讀取逐檔紀錄失敗：' + e.message })); });
+  }
+
+  function setHistMsg(msg, ok) { const m = $('histMsg'); if (m) { m.className = 'hint ' + (ok === true ? 'success' : ok === false ? 'error' : ''); m.textContent = msg; } }
+
+  async function renderHistory() {
+    const list = $('historyList'); if (!list) return;
+    let runs = [];
+    try { runs = await visibleRuns(); }
+    catch (e) { list.replaceChildren(el('li', { text: '無法讀取備份紀錄：' + e.message })); return; }
+    if ($('historyCount')) $('historyCount').textContent = `${runs.length} 次`;
+    ['histExportCsv', 'histExportJson', 'histClear'].forEach(id => { if ($(id)) $(id).disabled = !runs.length; });
+    if (!runs.length) { list.replaceChildren(el('li', { text: '尚無備份紀錄' })); return; }
+    list.replaceChildren(...runs.map(run => {
+      const c = run.counts, level = run.status === 'complete' ? 'ok' : (run.status === 'running' ? '' : (run.status === 'failed' || c.failed ? 'bad' : 'warn'));
+      const det = el('details', { class: 'hist-item' });
+      det.append(el('summary', { class: 'hist-head' },
+        el('div', { class: 'hist-line' },
+          el('strong', { text: fmtTime(run.startedAt) + (run.kind === 'retry' ? '（重試）' : '') }),
+          el('span', { class: 'pill ' + level, text: RUN_STATUS[run.status] || run.status })),
+        el('div', { class: 'filemeta', text: `成功 ${c.uploaded}｜跳過 ${c.dupSkipped + c.ledgerSkipped}｜失敗 ${c.failed}` + (c.unprocessed ? `｜未處理 ${c.unprocessed}` : '') + (c.md5Ok ? `｜MD5 驗證 ${c.md5Ok}` : '') })));
+      const body = el('div');
+      det.append(body);
+      det.addEventListener('toggle', () => { if (det.open && !body.childNodes.length) renderRunDetail(body, run); });
+      return el('li', null, det);
+    }));
+  }
+
+  // ----- 匯出 -----
+  const csvCell = v => { let s = String(v ?? ''); if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  function runsToCsv(runs) {
+    const head = ['備份開始', '備份結束', '狀態', '檔名', '大小(bytes)', '結果', '雲端資料夾', 'Drive檔案ID', '雲端檔名', 'MD5驗證', '錯誤訊息', '耗時(ms)'];
+    const rows = [head.map(csvCell).join(',')];
+    for (const r of runs) {
+      if (r.legacy) { rows.push([fmtTime(r.startedAt), fmtTime(r.endedAt), RUN_STATUS[r.status], '（舊版紀錄，無逐檔資料）', '', `成功${r.counts.uploaded}/跳過${r.counts.dupSkipped}/失敗${r.counts.failed}`, '', '', '', '', '', ''].map(csvCell).join(',')); continue; }
+      for (const it of r.items) {
+        rows.push([fmtTime(r.startedAt), fmtTime(r.endedAt), RUN_STATUS[r.status] || r.status, it.name, it.size, RESULT_LABEL[it.result] || it.result,
+          it.folder, it.driveId, it.uploadName, MD5_LABEL[it.md5] || it.md5 || '', it.error, it.ms].map(csvCell).join(','));
+      }
+    }
+    return '﻿' + rows.join('\r\n') + '\r\n'; // BOM：Excel 才會正確顯示中文
+  }
+
+  // 小檔案交付：觸控裝置優先開啟分享表單（可「儲存到檔案」），否則一般下載
+  async function deliverFile(file) {
+    if (navigator.maxTouchPoints > 1 && navigator.canShare && navigator.share) {
+      try { if (navigator.canShare({ files: [file] })) { await navigator.share({ files: [file] }); return 'shared'; } }
+      catch (e) { if (e && e.name === 'AbortError') return 'dismissed'; /* 其他錯誤：改用下載 */ }
+    }
+    anchorDownload(file, file.name);
+    return 'downloaded';
+  }
+
+  async function exportRuns(ids, fmt) {
+    try {
+      const all = await visibleRuns();
+      const runs = (ids ? all.filter(r => ids.includes(r.id)) : all).slice();
+      if (!runs.length) { setHistMsg('沒有可匯出的紀錄。', false); return; }
+      for (const r of runs) r.items = r.legacy ? [] : await runItemsOf(r.id);
+      const stamp = stampTag();
+      let file;
+      if (fmt === 'csv') file = new File([runsToCsv(runs)], `備份紀錄_${stamp}.csv`, { type: 'text/csv' });
+      else {
+        const payload = { app: 'iphone-drive-backup', version: APP_VERSION, exportedAt: new Date().toISOString(), runs: runs.map(r => { const { acct, _saved, ...rest } = r; return rest; }) };
+        file = new File([JSON.stringify(payload, null, 2)], `備份紀錄_${stamp}.json`, { type: 'application/json' });
+      }
+      const how = await deliverFile(file);
+      setHistMsg(how === 'dismissed' ? '已取消匯出。' : `已匯出 ${runs.length} 次備份紀錄（${fmt.toUpperCase()}）。`, how === 'dismissed' ? undefined : true);
+    } catch (e) { setHistMsg('匯出失敗：' + e.message, false); }
+  }
+
+  async function clearHistory() {
+    if (!confirm('清除所有備份紀錄？\n\n只會清除這台裝置上的紀錄，不會刪除 Drive 上的檔案，也不影響「本機備份帳本」。')) return;
+    try {
+      const all = await visibleRuns();
+      await runsDelete(all.map(r => r.id));
+      setHistMsg('已清除備份紀錄。', true);
+    } catch (e) { setHistMsg('清除失敗：' + e.message, false); }
+    await renderHistory(); renderLastBackup();
+  }
+
+  // ===== iPhone 本機／iCloud 聯絡人與行事曆：從「檔案」App 選 .vcf / .ics =====
+  // 網頁讀不到本機通訊錄與行事曆，所以由使用者先在 iPhone 匯出成檔案。這裡負責：
+  // 檢查選到的真的是 vCard／iCalendar（避免選錯檔）、顯示筆數、加上日期時間後和其他檔案一起備份。
+  // 檔名帶時間戳，每次都是一份新的快照，所以不進「本機備份帳本」（否則內容變了但大小相同時會被誤判為已備份）。
+  const pimFiles = []; // { key, orig, file, kind, count }
+  const PIM = {
+    vcf: { label: '聯絡人', icon: '👤', head: /^BEGIN:VCARD/i, marker: 'BEGIN:VCARD', unit: '位聯絡人', mime: 'text/vcard', ext: '.vcf' },
+    ics: { label: '行事曆', icon: '📅', head: /^BEGIN:VCALENDAR/i, marker: 'BEGIN:VEVENT', unit: '個事件', mime: 'text/calendar', ext: '.ics' }
+  };
+
+  // 分段計算標記出現次數（大檔不必整個讀進記憶體；以保留尾端的方式處理跨段的標記）
+  async function countMarker(file, marker) {
+    const re = new RegExp('\\n' + marker, 'gi');
+    const dec = new TextDecoder('utf-8');
+    const CH = 2 * 1024 * 1024, keep = marker.length; // 「換行＋標記」比保留的尾端長，所以不會重複計算
+    let carry = '\n', count = 0;                      // 開頭先補一個換行，檔案第一行也能比對到
+    for (let off = 0; off < file.size; off += CH) {
+      const buf = new Uint8Array(await file.slice(off, Math.min(off + CH, file.size)).arrayBuffer());
+      const text = carry + dec.decode(buf, { stream: off + CH < file.size });
+      re.lastIndex = 0;
+      while (re.exec(text)) count++;
+      carry = text.slice(-keep);
+      await sleep(0);
+    }
+    return count;
+  }
+
+  async function inspectPim(file, kind) {
+    const spec = PIM[kind];
+    if (!file.size) return { ok: false, why: '檔案是空的。' };
+    const head = new Uint8Array(await file.slice(0, 4096).arrayBuffer());
+    if ((head[0] === 0xff && head[1] === 0xfe) || (head[0] === 0xfe && head[1] === 0xff)) return { ok: false, why: '檔案是 UTF-16 編碼，請改用 UTF-8 的檔案。' };
+    const text = new TextDecoder('utf-8').decode(head).replace(/^﻿/, '').trimStart();
+    if (!spec.head.test(text)) return { ok: false, why: `看起來不是${spec.label}檔（開頭應該是 ${spec.marker === 'BEGIN:VCARD' ? 'BEGIN:VCARD' : 'BEGIN:VCALENDAR'}），是不是選錯檔案了？` };
+    const count = await countMarker(file, spec.marker);
+    if (!count) return { ok: false, why: `檔案裡找不到任何${kind === 'vcf' ? '聯絡人' : '事件'}。` };
+    return { ok: true, count };
+  }
+
+  async function addPimFiles(fileList, kind) {
+    const spec = PIM[kind], notes = [];
+    for (const f of Array.from(fileList)) {
+      const key = `${kind}|${fingerprint(f)}`;
+      if (pimFiles.some(p => p.key === key)) continue;
+      let info;
+      try { info = await inspectPim(f, kind); } catch (e) { info = { ok: false, why: '讀取失敗：' + e.message }; }
+      if (!info.ok) { notes.push(`「${f.name}」沒有加入：${info.why}`); continue; }
+      const base = f.name.replace(/\.[^.]*$/, '') || spec.label;
+      // new File([f], …) 只是參照原檔資料，不會複製一份到記憶體
+      const file = new File([f], `iPhone_${spec.label}_${safeSeg(base)}_${stampTag()}${spec.ext}`, { type: spec.mime, lastModified: f.lastModified });
+      generatedFiles.add(file);
+      pimFiles.push({ key, orig: f.name, file, kind, count: info.count });
+    }
+    const m = $('pimMsg');
+    if (m) { m.className = 'hint ' + (notes.length ? 'error' : ''); m.textContent = notes.join('\n'); }
+    renderPim(); refreshSelection();
+  }
+
+  function renderPim() {
+    const ul = $('pimList'); if (!ul) return;
+    ul.replaceChildren(...pimFiles.map(p => {
+      const rm = el('button', { class: 'secondary btn-small', type: 'button', text: '移除' });
+      rm.addEventListener('click', () => { const i = pimFiles.indexOf(p); if (i >= 0) pimFiles.splice(i, 1); renderPim(); refreshSelection(); });
+      return el('li', { class: 'pim-row' },
+        el('div', null, `${PIM[p.kind].icon} ${p.orig}`, el('br'),
+          el('span', { class: 'filemeta', text: `${p.count} ${PIM[p.kind].unit}｜${humanSize(p.file.size)}｜備份後檔名：${p.file.name}` })), rm);
+    }));
+  }
+
+  // ===== 備份流程：忙碌狀態、取消、執行、只重試失敗 =====
   function setBusy(busy) {
     uploading = busy;
     if (busy) {
@@ -1389,20 +1897,37 @@
     cancelRequested = true;
     $('cancelBackup').disabled = true; $('cancelBackup').textContent = '正在取消…';
     $('uploadState').textContent = '取消中';
-    if (currentXhr) currentXhr.abort();
-    if (!$('reauthBox').hidden) $('reauthCancel').click();
+    if (currentXhr) currentXhr.abort();                       // 正在傳的檔案立刻中止
+    if (!$('reauthBox').hidden) $('reauthCancel').click();    // 正在等重新授權：一併結束等待
   }
 
-  async function runJobs(allJobs, notes = []) {
-    lastBackupStartedAt = Date.now();
-    const startedAt = lastBackupStartedAt;
-    failedJobs = allJobs.slice();
+  // 外層：建立／結束備份紀錄。任何離開方式（正常完成、取消、例外）都會把紀錄收尾，不會留下「進行中」。
+  async function runJobs(allJobs, notes = [], kind = 'backup') {
+    const run = await beginRun(kind, notes);
+    const seen = new Set(); // 已經有結果的檔案；收尾時沒出現的一律記成「未處理」
+    try {
+      await runJobsCore(allJobs, notes, run, seen);
+    } catch (err) {
+      if (run.status === 'running') { addUnprocessed(run, allJobs, seen); await finishRun(run, err.cancelled ? 'cancelled' : 'failed', err.cancelled ? '' : err.message); }
+      throw err;
+    } finally {
+      if (run.status === 'running') { addUnprocessed(run, allJobs, seen); await finishRun(run, 'cancelled'); } // 提早結束（取消、空間不足）
+      renderHistory(); renderLastBackup();
+    }
+  }
+
+  function addUnprocessed(run, jobs, seen) {
+    jobs.forEach(f => { if (!seen.has(f)) { seen.add(f); recordItem(run, f, { result: 'unprocessed' }); } });
+  }
+
+  async function runJobsCore(allJobs, notes, run, seen) {
+    failedJobs = allJobs.slice(); // 先假設全部都要重試；途中若丟出例外，下次仍可重試
     exifrMissingCount = 0;
     let success = 0;
     const skipped = [], renamed = [], failures = [], failedFiles = [];
-    const fileResults = [];
-    let stopIndex = -1, stopReason = null;
+    let stopIndex = -1, stopReason = null; // stopIndex 起算的檔案都視為「未處理」
 
+    // 先比對本機帳本：已備份且 Drive 驗證仍在的檔案直接跳過，不做分類／查重複／上傳
     $('uploadState').textContent = '比對本機帳本';
     let plan;
     try { plan = await planWithLedger(allJobs); }
@@ -1414,8 +1939,11 @@
       }
       throw err;
     }
-    plan.ledgerSkipped.forEach(f => fileResults.push({ name: f.name, size: f.size, status: 'ledger-skipped', message: '先前已備份且驗證仍在 Drive' }));
-
+    plan.ledgerSkipped.forEach(f => {
+      seen.add(f);
+      const rec = plan.skipRecs.get(f);
+      recordItem(run, f, { result: 'ledger-skip', driveId: rec && rec.driveId, uploadName: rec && rec.uploadName, folder: '' });
+    });
     const jobs = plan.toProcess;
     failedJobs = jobs.slice();
     if (jobs.length === 0) $('progress').value = 100;
@@ -1426,20 +1954,23 @@
     if (!space.proceed) {
       $('uploadState').textContent = '已取消'; $('progressText').textContent = '';
       showResult('已取消：雲端空間可能不足。清出空間後，可按「只重試失敗／未完成的檔案」。', 'error');
-      await saveBackupRun({ id: startedAt, startedAt, endedAt: Date.now(), total: allJobs.length, success: 0, skipped: 0, ledgerSkipped: plan.ledgerSkipped.length, failures: 0, unprocessed: jobs.length, notes, files: fileResults, stopReason: 'space-cancelled' });
-      loadBackupHistory();
       return;
     }
 
     const rootFolderId = jobs.length ? await getRootFolderId() : null;
+    let md5Ok = 0, md5Skipped = 0;
 
     for (let i = 0; i < jobs.length; i++) {
       if (cancelRequested) { stopIndex = i; stopReason = 'cancel'; break; }
       const file = jobs[i];
       $('uploadState').textContent = `處理中 ${i+1}/${jobs.length}`;
+      const t0 = Date.now();
+      const vstate = { md5: '' }; // 上傳流程回報的 MD5 驗證結果
+
       try {
         $('progressText').textContent = `分析分類：${file.name}`;
-        const targetFolderId = await getTargetFolder(file, rootFolderId);
+        const target = await getTargetFolder(file, rootFolderId);
+        const targetFolderId = target.id;
         throwIfCancelled();
         $('progressText').textContent = `檢查是否重複：${file.name}`;
         const dup = await checkDuplicate(file, targetFolderId);
@@ -1447,52 +1978,45 @@
 
         if (dup.duplicate) {
           skipped.push(file.name);
-          fileResults.push({ name: file.name, size: file.size, status: 'skipped', driveId: dup.existingId, message: 'Drive 已有同名同大小檔案' });
-          await ledgerRecord(file, dup.existingId, targetFolderId, dup.existingName);
+          console.log(`跳過重複檔案（檔名與大小相同）: ${file.name}`);
+          await ledgerRecord(file, dup.existingId, targetFolderId, dup.existingName); // 認領 Drive 上既有的備份，下次可直接由帳本跳過
+          seen.add(file);
+          recordItem(run, file, { result: 'dup-skip', driveId: dup.existingId, uploadName: dup.existingName, folder: target.path, ms: Date.now() - t0 });
         } else {
           $('progressText').textContent = `正在上傳：${file.name}`;
           const up = await uploadFileWithRetry(file, targetFolderId, fraction => {
             $('progress').value = ((i + fraction) / jobs.length) * 100;
-          }, dup.uploadName);
+          }, dup.uploadName, vstate);
           if (dup.uploadName !== file.name) renamed.push(`${file.name} → ${dup.uploadName}`);
-
-          // 新增：可選的 MD5 驗證（≤100MB）
-          let md5Verified = false;
-          if (up && up.md5Checksum && $('md5Verify') && $('md5Verify').checked && file.size <= 100 * 1024 * 1024) {
-            try {
-              $('progressText').textContent = `驗證 MD5：${file.name}`;
-              const localMd5 = md5(await file.arrayBuffer());
-              if (localMd5 !== up.md5Checksum) throw new Error(`MD5 不符（本地 ${localMd5}，雲端 ${up.md5Checksum}）`);
-              md5Verified = true;
-            } catch (e) {
-              if (e.message && e.message.startsWith('MD5')) throw e;
-              console.warn('MD5 驗證失敗（略過）:', e);
-            }
-          }
-
           success++;
-          fileResults.push({ name: file.name, size: file.size, status: 'success', driveId: up && up.id, uploadName: up && up.name, md5Verified });
-          await ledgerRecord(file, up && up.id, targetFolderId, up && up.name);
+          if (vstate.md5 === 'ok') md5Ok++; else if (vstate.md5 === 'skipped-large') md5Skipped++;
+          await ledgerRecord(file, up && up.id, targetFolderId, up && up.name, up && up.md5Checksum);
+          seen.add(file);
+          recordItem(run, file, { result: 'uploaded', driveId: up && up.id, uploadName: up && up.name, folder: target.path, md5: vstate.md5, ms: Date.now() - t0 });
         }
       } catch (err) {
+        // 使用者取消：這個檔案算「未處理」（可能傳到一半），重試時會再檢查重複
         if (err.cancelled || (err.aborted && cancelRequested)) { stopIndex = i; stopReason = 'cancel'; break; }
         failures.push(`${file.name}：${err.message}`);
         failedFiles.push(file);
-        fileResults.push({ name: file.name, size: file.size, status: 'failure', message: err.message });
-        if (err.aborted) { stopIndex = i + 1; stopReason = 'reauth'; break; }
-        if (err.quota) { stopIndex = i + 1; stopReason = 'quota'; break; }
+        seen.add(file);
+        recordItem(run, file, { result: 'failed', error: err.message, md5: vstate.md5, ms: Date.now() - t0 });
+        if (err.aborted) { stopIndex = i + 1; stopReason = 'reauth'; break; } // 放棄重新授權：停止後續檔案
+        if (err.quota) { stopIndex = i + 1; stopReason = 'quota'; break; }    // 雲端空間已滿：停止後續檔案
       }
       $('progress').value = ((i + 1) / jobs.length) * 100;
+      runCheckpoint(run); // 不等待；App 被關掉時已完成的部分仍會留在紀錄裡
     }
 
     const unprocessed = stopIndex >= 0 ? jobs.slice(stopIndex) : [];
-    unprocessed.forEach(f => fileResults.push({ name: f.name, size: f.size, status: 'unprocessed' }));
     failedJobs = [...failedFiles, ...unprocessed];
 
     $('uploadState').textContent = stopReason === 'cancel' ? '已取消' : (failures.length || unprocessed.length ? '部分完成' : '完成');
     let msg = stopReason === 'cancel' ? '備份已取消。' : (stopReason ? '備份已中止。' : '備份完成！');
     msg += `\n成功上傳：${success} 個`;
     if (notes.length) msg += `\n（${notes.join('、')}）`;
+    if (md5Ok > 0) msg += `\nMD5 驗證通過：${md5Ok} 個`;
+    if (md5Skipped > 0) msg += `\n未做 MD5 驗證（檔案超過 100 MB，只比對了大小）：${md5Skipped} 個`;
     if (plan.ledgerSkipped.length > 0) msg += `\n帳本跳過：${plan.ledgerSkipped.length} 個（先前已備份，且已向 Drive 驗證仍在）`;
     if (skipped.length > 0) msg += `\n跳過重複：${skipped.length} 個`;
     if (plan.stale > 0) msg += `\n帳本中有 ${plan.stale} 個項目在 Drive 已不存在或已變更，已重新備份並更新帳本。`;
@@ -1507,26 +2031,21 @@
 
     showResult(msg, (failures.length || stopReason === 'reauth' || stopReason === 'quota') ? 'error' : (stopReason === 'cancel' ? '' : 'success'));
     $('progressText').textContent = '上傳工作已結束。';
-    saveBackupHistory(success, skipped.concat(plan.ledgerSkipped), failures);
-    await saveBackupRun({
-      id: startedAt, startedAt, endedAt: Date.now(),
-      total: allJobs.length, success,
-      skipped: skipped.length + plan.ledgerSkipped.length,
-      ledgerSkipped: plan.ledgerSkipped.length,
-      failures: failures.length, unprocessed: unprocessed.length,
-      notes, files: fileResults, stopReason: stopReason || null
-    });
-    loadBackupHistory();
+
+    addUnprocessed(run, unprocessed, seen);
+    const status = stopReason === 'cancel' ? 'cancelled' : stopReason ? 'stopped' : (failures.length ? 'partial' : 'complete');
+    await finishRun(run, status);
   }
 
   async function startBackup() {
     if (uploading || ledgerBusy || !accessToken) return;
     const wantContacts = $('includeContacts').checked;
     const wantCalendar = $('includeCalendar').checked;
-    if (selectedFiles.length === 0 && !wantContacts && !wantCalendar) return;
+    if (selectedFiles.length === 0 && pimFiles.length === 0 && !wantContacts && !wantCalendar) return;
     if (wantContacts && !hasScope(SCOPE_CONTACTS)) { showResult('尚未授權讀取聯絡人，請取消勾選後重新勾選一次。', 'error'); return; }
     if (wantCalendar && !hasScope(SCOPE_CALENDAR)) { showResult('尚未授權讀取行事曆，請取消勾選後重新勾選一次。', 'error'); return; }
 
+    // EXIF 套件沒載入時，照片會改用檔案時間分類，結果可能不對：先讓使用者知道
     if (!window.exifr && selectedFiles.some(f => isMedia(f) && (f.type.startsWith('image/') || EXIF_EXT.test(f.name)))) {
       if (!confirm('⚠️ EXIF 解析套件沒有載入成功。\n\n照片會改用「檔案修改時間」分類，可能被放到錯誤的年月或「未分類照片」。\n\n建議先重新整理頁面。要仍然繼續備份嗎？')) return;
     }
@@ -1535,6 +2054,7 @@
     failedJobs = [];
     $('uploadState').textContent = '準備中'; showResult('');
 
+    // 先確認授權有效（若需要續期，此時仍在使用者點擊的手勢內，彈窗較不會被 iOS 擋下）
     try { await ensureToken(); }
     catch (err) {
       showResult('授權未完成：' + err.message, 'error'); $('uploadState').textContent = '失敗';
@@ -1542,7 +2062,7 @@
     }
 
     const notes = [];
-    const generated = [];
+    const generated = []; // 產生的 .vcf/.ics 另外存放，不混進使用者的選取清單
     try {
       if (wantContacts) { const r = await generateContactsVcf(); generated.push(r.file); notes.push(`聯絡人 ${r.count} 筆`); throwIfCancelled(); }
       if (wantCalendar) { const r = await generateCalendarIcs(); generated.push(r.file); notes.push(`行事曆事件 ${r.count} 筆（${r.calendars} 個行事曆）`); throwIfCancelled(); }
@@ -1554,12 +2074,15 @@
 
     try {
       generated.forEach(f => generatedFiles.add(f));
-      await runJobs([...selectedFiles, ...generated], notes);
+      const pimJobs = pimFiles.map(p => p.file);
+      if (pimFiles.length) notes.push(`iPhone 本機檔 ${pimFiles.length} 個（${pimFiles.map(p => `${p.count} ${PIM[p.kind].unit}`).join('、')}）`);
+      await runJobs([...selectedFiles, ...pimJobs, ...generated], notes);
     } catch (err) {
       $('uploadState').textContent = '失敗'; showResult('備份準備失敗：' + err.message, 'error');
     } finally {
       $('includeContacts').checked = false;
       $('includeCalendar').checked = false;
+      pimFiles.length = 0; renderPim(); // 已交給備份流程；失敗的會留在「只重試」清單
       setBusy(false);
     }
   }
@@ -1573,10 +2096,10 @@
     try { await ensureToken(); }
     catch (err) {
       showResult('授權未完成：' + err.message, 'error'); $('uploadState').textContent = '失敗';
-      setBusy(false); return;
+      setBusy(false); return; // failedJobs 保持不變，仍可再試
     }
     try {
-      await runJobs(jobs, ['這是只重試失敗／未完成檔案的結果']);
+      await runJobs(jobs, ['這是只重試失敗／未完成檔案的結果'], 'retry');
     } catch (err) {
       $('uploadState').textContent = '失敗'; showResult('重試準備失敗：' + err.message, 'error');
     } finally {
@@ -1589,6 +2112,9 @@
   $('retryFailed').addEventListener('click', retryFailed);
 
   // ===== PWA 更新流程 =====
+  // 原本的問題：① 按確定後立刻 reload，新 SW 還沒接手，可能又載到舊版；
+  // ② 備份進行中跳 confirm 並重新載入，會把上傳整個中斷；
+  // ③ 上次忽略提示後，下次開啟時新版仍在待命，但不會再有任何提示。
   function initServiceWorker() {
     if (!('serviceWorker' in navigator) || !location.protocol.startsWith('http')) return;
     const hadController = !!navigator.serviceWorker.controller;
@@ -1606,10 +2132,11 @@
 
     function offer(worker) { waiting = worker; mode = 'update'; updateRequested = false; renderBar(); }
 
+    // 新 SW 真正接手後才重新載入（不是按下按鈕就載入）
     navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (!hadController || reloading) return;
+      if (!hadController || reloading) return; // 第一次安裝時 clients.claim() 也會觸發，不需重載
       if (updateRequested && !uploading) { reloading = true; location.reload(); return; }
-      mode = 'reload'; renderBar();
+      mode = 'reload'; renderBar();            // 其他視窗已更新，或更新途中使用者開始了備份
     });
 
     $('updateNow').addEventListener('click', () => {
@@ -1629,14 +2156,14 @@
       try {
         const reg = await navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' });
         swReg = reg;
-        if (reg.waiting && navigator.serviceWorker.controller) offer(reg.waiting);
+        if (reg.waiting && navigator.serviceWorker.controller) offer(reg.waiting); // 先前忽略、仍在待命的新版
         reg.addEventListener('updatefound', () => {
           const nw = reg.installing; if (!nw) return;
           const check = () => { if (nw.state === 'installed' && navigator.serviceWorker.controller) offer(nw); };
           nw.addEventListener('statechange', check);
           check();
         });
-        setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
+        setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000); // 常駐的 App 也會定期檢查
       } catch (err) { console.error('SW 註冊失敗:', err); }
     }
     if (document.readyState === 'complete') register(); else window.addEventListener('load', register);
@@ -1644,7 +2171,25 @@
   initServiceWorker();
 
   if (!window.exifr && $('exifrWarn')) $('exifrWarn').hidden = false;
+  // ===== 設定項目與啟動 =====
+  if ($('verifyMode')) {
+    $('verifyMode').value = verifyMode;
+    $('verifyMode').addEventListener('change', e => { verifyMode = e.target.value; try { localStorage.setItem(VERIFY_KEY, verifyMode); } catch (err) { /* 存不下就只在這次生效 */ } });
+  }
+  if ($('remindDays')) {
+    $('remindDays').value = String(getRemindDays());
+    $('remindDays').addEventListener('change', e => { try { localStorage.setItem(REMIND_KEY, e.target.value); } catch (err) { /* 忽略 */ } renderLastBackup(); });
+  }
+  if ($('histExportCsv')) $('histExportCsv').addEventListener('click', () => exportRuns(null, 'csv'));
+  if ($('histExportJson')) $('histExportJson').addEventListener('click', () => exportRuns(null, 'json'));
+  if ($('histClear')) $('histClear').addEventListener('click', clearHistory);
+
   refreshSelection();
-  loadBackupHistory();
   renderLedgerStats();
+  (async () => {
+    try { await migrateLegacyHistory(); await markInterruptedRuns(); } catch (e) { console.warn('整理備份紀錄失敗:', e); }
+    renderHistory(); renderLastBackup();
+  })();
+  setInterval(renderLastBackup, 60000); // 「X 分鐘前」會自己更新
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') renderLastBackup(); });
 })();
